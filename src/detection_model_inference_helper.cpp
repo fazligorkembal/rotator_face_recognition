@@ -14,7 +14,13 @@ DetectionModelInferenceHelper::DetectionModelInferenceHelper(
         std::vector<int32_t> strides,
         int32_t top_k,
         float confidence_threshold,
-        float iou_threshold)
+        float iou_threshold,
+        int32_t camera_input_height,
+        int32_t camera_input_width,
+        int32_t num_slices_x,
+        int32_t num_slices_y,
+        int32_t gap_x,
+        int32_t gap_y)
 {
 
     //INFO
@@ -26,6 +32,8 @@ DetectionModelInferenceHelper::DetectionModelInferenceHelper(
     LOG_DEBUG("\tTop K: {}", top_k);
     LOG_DEBUG("\tConfidence threshold: {}", confidence_threshold);
     LOG_DEBUG("\tIoU threshold: {}", iou_threshold);
+    LOG_DEBUG("\tCamera input height: {}", camera_input_height);
+    LOG_DEBUG("\tCamera input width: {}", camera_input_width);
 
     cudaGetDeviceProperties(&device_prop_, 0);
     device_name_ = device_prop_.name;
@@ -46,6 +54,12 @@ DetectionModelInferenceHelper::DetectionModelInferenceHelper(
     batch_sizes_ = batch_sizes;
     model_input_height_ = model_input_height;
     model_input_width_ = model_input_width;
+    camera_input_height_ = camera_input_height;
+    camera_input_width_ = camera_input_width;
+    num_slices_x_ = num_slices_x;
+    num_slices_y_ = num_slices_y;
+    gap_x_ = gap_x;
+    gap_y_ = gap_y;
     strides_ = strides;
     top_k_ = top_k;
     confidence_threshold_ = confidence_threshold;
@@ -55,6 +69,23 @@ DetectionModelInferenceHelper::DetectionModelInferenceHelper(
     context_detection_ = engine->createExecutionContext();
     cudaStreamCreate(&stream_);
     allocateBuffers();
+    computeSlices();
+
+    std::vector<int> coords;
+    coords.reserve(slices_.size() * 4);
+    for (const auto &s : slices_)
+    {
+        coords.push_back(s.x1);
+        coords.push_back(s.y1);
+        coords.push_back(s.x2);
+        coords.push_back(s.y2);
+    }
+    if (!setDeviceSymbols(coords))
+    {
+        LOG_ERROR("Failed to copy slice coordinates to device constant memory");
+        std::exit(EXIT_FAILURE);
+    }
+    LOG_INFO("Slice coordinates copied to device constant memory");
 
 }
 
@@ -68,7 +99,7 @@ DetectionModelInferenceHelper::~DetectionModelInferenceHelper(){
 void DetectionModelInferenceHelper::allocateBuffers() {
     LOG_INFO("***** allocateBuffers *****");
 
-    input_buffer_size_uint8_t_ = static_cast<size_t>(batch_sizes_[2]) * model_input_height_ * model_input_width_ * 3;
+    input_buffer_size_uint8_t_ = static_cast<size_t>(camera_input_height_) * camera_input_width_ * 3;
     input_buffer_size_float_   = static_cast<size_t>(batch_sizes_[2]) * 3 * model_input_height_ * model_input_width_;
 
     // uint8 input: mapped pinned memory → GPU accesses same physical RAM, no PCIe transfer
@@ -79,6 +110,35 @@ void DetectionModelInferenceHelper::allocateBuffers() {
     // float32 CHW buffer: preprocessing kernel writes here, TensorRT reads from here
     cudaMalloc(&device_jetson_input_buffer_float_, input_buffer_size_float_ * sizeof(float));
     LOG_DEBUG("\tAllocated device float input buffer: {} mb", input_buffer_size_float_ * sizeof(float) / (1024.0 * 1024.0));
+}
+
+std::vector<int> DetectionModelInferenceHelper::makePositions(int dim, int win, int gap, int num) {
+    std::vector<int> pos;
+    int step = win - gap;
+    int span = (num - 1) * step + win;
+    int pad  = (dim - span) / 2;
+    for (int i = 0; i < num; ++i)
+        pos.push_back(pad + i * step);
+    return pos;
+}
+
+void DetectionModelInferenceHelper::computeSlices() {
+    auto xs = makePositions(camera_input_width_,  model_input_width_,  gap_x_, num_slices_x_);
+    auto ys = makePositions(camera_input_height_, model_input_height_, gap_y_, num_slices_y_);
+
+    num_slices_x_ = static_cast<int>(xs.size());
+    num_slices_y_ = static_cast<int>(ys.size());
+    slices_.reserve(num_slices_x_ * num_slices_y_);
+
+    for (int y : ys)
+        for (int x : xs)
+            slices_.push_back({x, y, x + model_input_width_, y + model_input_height_});
+
+    LOG_INFO("Computed {} slices ({}x{})", slices_.size(), num_slices_x_, num_slices_y_);
+    for (size_t i = 0; i < slices_.size(); ++i) {
+        const auto &s = slices_[i];
+        LOG_DEBUG("\tSlice {}: [{},{} -> {},{}]", i, s.x1, s.y1, s.x2, s.y2);
+    }
 }
 
 void DetectionModelInferenceHelper::freeBuffers() {
@@ -95,12 +155,11 @@ void DetectionModelInferenceHelper::freeBuffers() {
     }
 }
 
-void DetectionModelInferenceHelper::infer(const uint8_t *host_image) {
-    // CPU writes image into mapped buffer, GPU reads via device_jetson_ptr_uint8_t_
+void DetectionModelInferenceHelper::infer(const uint8_t *host_image, int batch_size) {
     std::memcpy(host_jetson_input_buffer_uint8_t_, host_image, input_buffer_size_uint8_t_);
 
-    // preprocessing: uint8 BGR HWC → float32 RGB CHW via device pointer (zero-copy)
-    launchPreprocessKernel(device_jetson_ptr_uint8_t_, device_jetson_input_buffer_float_, 1, stream_);
+    // preprocessing: uint8 BGR HWC 1920x1080 → float32 RGB CHW 640x640, kernel handles resize
+    launchPreprocessKernel(device_jetson_ptr_uint8_t_, device_jetson_input_buffer_float_, batch_size, stream_);
 
     cudaStreamSynchronize(stream_);
 

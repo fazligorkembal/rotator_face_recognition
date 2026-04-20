@@ -16,7 +16,11 @@
         "conf_threshold": 0.5,
         "nms_threshold": 0.4,
         "batch_sizes": [1, 6, 6],
-        "strides": [8, 16, 32]
+        "strides": [8, 16, 32],
+        "num_slices_x": 3,
+        "num_slices_y": 2,
+        "gap_x": 128,
+        "gap_y": 200
     },
     "identification": {
         "model_path": "/home/user/Documents/tensorrt_scrfd/models/r50.engine",

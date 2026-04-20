@@ -120,6 +120,14 @@ int main()
     int32_t width = data_config["detection"]["input_size"];
     float confidence_threshold = data_config["detection"]["conf_threshold"];
     float iou_threshold = data_config["detection"]["nms_threshold"];
+    int32_t camera_height  = data_config["camera"]["height"];
+    int32_t camera_width   = data_config["camera"]["width"];
+    int32_t num_slices_x   = data_config["detection"]["num_slices_x"];
+    int32_t num_slices_y   = data_config["detection"]["num_slices_y"];
+    int32_t gap_x          = data_config["detection"]["gap_x"];
+    int32_t gap_y          = data_config["detection"]["gap_y"];
+
+    
 
     auto thread_inference = std::thread([&]()
                                         {
@@ -131,13 +139,28 @@ int main()
                                                 strides,
                                                 top_k,
                                                 confidence_threshold,
-                                                iou_threshold);
+                                                iou_threshold,
+                                                camera_height,
+                                                camera_width,
+                                                num_slices_x,
+                                                num_slices_y,
+                                                gap_x,
+                                                gap_y);
 
                                             std::string image_path = data_config["detection"]["test_image_path"];
                                             cv::Mat img = cv::imread(image_path);
-                                            cv::resize(img, img, cv::Size(1920, 1080));
-
-                                            inferenceHelper.infer(img.data);
+                                            if (img.empty()) {
+                                                LOG_ERROR("Failed to load image: {}", image_path);
+                                                return;
+                                            }
+                                            auto start_time = std::chrono::high_resolution_clock::now();
+                                            for(int i = 0; i < 5000; ++i) {
+                                                inferenceHelper.infer(img.data, 1);    
+                                            }
+                                            auto end_time = std::chrono::high_resolution_clock::now();
+                                            std::chrono::duration<double> elapsed = end_time - start_time;
+                                            LOG_INFO("Inference completed in {:.2f} seconds for 5000 iterations (average {:.2f} ms per inference)", elapsed.count(), (elapsed.count() * 1000) / 5000);
+                                            
 
                                         });
 

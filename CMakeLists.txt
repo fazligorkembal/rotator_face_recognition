@@ -36,7 +36,7 @@ set(COMMON_LIBS
     nvinfer
     nvinfer_plugin
     nvonnxparser
-    ${CUDA_LIBRARIES}
+    CUDA::cudart
     ${OpenCV_LIBS}
 )
 
