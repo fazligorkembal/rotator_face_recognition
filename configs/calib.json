@@ -1,0 +1,26 @@
+{
+    "general": {
+        "device": 0,
+        "top_k": 500,
+        "log_level": "debug"
+    },
+    "camera": {
+        "path": "videos/test.mp4",
+        "width": 1920,
+        "height": 1080
+    },
+    "detection": {
+        "model_path": "/home/user/Documents/rfr/models/det_10g_dynamic_1_6_fp16.engine",
+        "test_image_path": "/home/user/Documents/tensorrt_scrfd/datasets/tensorrt_scrfd/tbbt.jpg",
+        "input_size": 640,
+        "conf_threshold": 0.5,
+        "nms_threshold": 0.4,
+        "batch_sizes": [1, 6, 6],
+        "strides": [8, 16, 32]
+    },
+    "identification": {
+        "model_path": "/home/user/Documents/tensorrt_scrfd/models/r50.engine",
+        "input_size": 112,
+        "feature_dim": 512
+    }
+}

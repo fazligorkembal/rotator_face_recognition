@@ -1,0 +1,2 @@
+trtexec --onnx=models/det_10g_dynamic.onnx   --minShapes=input.1:1x3x640x640   --optShapes=input.1:6x3x640x640   --maxShapes=input.1:6x3x640x640   --fp16   --saveEngine=models/det_10g_dynamic_1_6_fp16.engine
+trtexec --loadEngine=models/det_10g_dynamic_1_6_fp16.engine --fp16 --useCudaGraph --useManagedMemory --threads --iterations=5000   --shapes=input.1:1x3x640x640
