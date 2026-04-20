@@ -1,7 +1,7 @@
 {
     "general": {
         "device": 0,
-        "top_k": 500,
+        "top_k": 50,
         "log_level": "debug"
     },
     "camera": {
@@ -11,7 +11,7 @@
     },
     "detection": {
         "model_path": "/home/user/Documents/rfr/models/det_10g_dynamic_1_6_fp16.engine",
-        "test_image_path": "/home/user/Documents/tensorrt_scrfd/datasets/tensorrt_scrfd/tbbt.jpg",
+        "test_image_path": "/home/user/Documents/rfr/datasets/rfr/test1.png",
         "input_size": 640,
         "conf_threshold": 0.5,
         "nms_threshold": 0.4,
