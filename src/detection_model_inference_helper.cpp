@@ -76,16 +76,43 @@ DetectionModelInferenceHelper::DetectionModelInferenceHelper(
     }
     cudaStreamCreate(&stream_);
     allocateBuffers();
-    
-    const char *input_tensor_name = engine->getIOTensorName(0);
-    const char *output_tensor_name_scores = engine->getIOTensorName(1);
-    const char *output_tensor_name_bboxes = engine->getIOTensorName(2);
-    const char *output_tensor_name_landmarks = engine->getIOTensorName(3);
+    computeSlices();
 
-    context_detection_->setTensorAddress(input_tensor_name, device_jetson_input_buffer_float_);
-    context_detection_->setTensorAddress(output_tensor_name_scores, device_model_output_scores_);
-    context_detection_->setTensorAddress(output_tensor_name_bboxes, device_model_output_bboxes_);
+    std::vector<int> coords;
+    coords.reserve(slices_.size() * 4);
+    for (const auto &s : slices_) {
+        coords.push_back(s.x1);
+        coords.push_back(s.y1);
+        coords.push_back(s.x2);
+        coords.push_back(s.y2);
+    }
+    if (!setDeviceSymbols(coords,
+                          camera_input_width_, camera_input_height_,
+                          model_input_width_,  model_input_height_,
+                          anchor_count_,
+                          confidence_threshold_,
+                          top_k_)) {
+        LOG_ERROR("Failed to copy slice coordinates to device constant memory");
+        std::exit(EXIT_FAILURE);
+    }
+    LOG_INFO("Slice coordinates copied to device constant memory");
+
+    int nb_tensors = engine->getNbIOTensors();
+    LOG_INFO("Engine has {} IO tensors:", nb_tensors);
+    for (int i = 0; i < nb_tensors; ++i)
+        LOG_INFO("  [{}] {}", i, engine->getIOTensorName(i));
+
+    const char *input_tensor_name           = engine->getIOTensorName(0);
+    const char *output_tensor_name_scores   = engine->getIOTensorName(1);
+    const char *output_tensor_name_bboxes   = engine->getIOTensorName(2);
+    const char *output_tensor_name_landmarks= engine->getIOTensorName(3);
+
+    context_detection_->setTensorAddress(input_tensor_name,            device_jetson_input_buffer_float_);
+    context_detection_->setTensorAddress(output_tensor_name_scores,    device_model_output_scores_);
+    context_detection_->setTensorAddress(output_tensor_name_bboxes,    device_model_output_bboxes_);
     context_detection_->setTensorAddress(output_tensor_name_landmarks, device_model_output_landmarks_);
+
+    context_detection_->setInputShape(input_tensor_name, nvinfer1::Dims4{batch_sizes_[1], 3, model_input_height_, model_input_width_});
 
 }
 
@@ -100,10 +127,71 @@ void DetectionModelInferenceHelper::infer(const uint8_t *host_image, int batch_s
     
     launchPreprocessKernel(device_jetson_ptr_uint8_t_, device_jetson_input_buffer_float_, batch_size, stream_);    
     context_detection_->enqueueV3(stream_);
-    
-
 
     cudaStreamSynchronize(stream_);
+
+size_t batch_selected = 4;
+#ifdef PRINTMODELOUTPUTS
+    // Verify preprocessed input: read pixel (0,0) from each batch's float buffer.
+    // Expected value = (src[y1*cam_w + x1] channel R - 127.5) / 128.0
+    {
+        int plane = model_input_height_ * model_input_width_;
+        std::vector<float> px(batch_size);
+        for (int b = 0; b < batch_size; ++b) {
+            cudaMemcpy(&px[b],
+                       device_jetson_input_buffer_float_ + b * 3 * plane,
+                       sizeof(float), cudaMemcpyDeviceToHost);
+        }
+        LOG_INFO("[PREPROCESS_VERIFY] pixel(0,0) R-channel of preprocessed float buffer:");
+        for (int b = 0; b < batch_size; ++b) {
+            const auto &s = slices_[b];
+            // Expected: R channel at (s.x1, s.y1) of source image
+            const uint8_t *src = host_jetson_input_buffer_uint8_t_;
+            float expected = (src[(s.y1 * camera_input_width_ + s.x1) * 3 + 2] - 127.5f) / 128.0f;
+            LOG_INFO("  batch {:d} slice [{:4d},{:4d}] | gpu_pixel: {:.4f} | expected: {:.4f} | match: {}",
+                     b, s.x1, s.y1, px[b], expected, std::abs(px[b] - expected) < 1e-4f ? "YES" : "NO");
+        }
+    }
+#endif
+#ifdef PRINTMODELOUTPUTS
+    {
+        int total_batches = batch_sizes_[1];
+        std::vector<float> h_scores_all(total_batches * anchor_count_);
+        cudaMemcpy(h_scores_all.data(), device_model_output_scores_,
+                   total_batches * anchor_count_ * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // Per-batch: max score + detections above threshold
+        for (int b = 0; b < total_batches; ++b) {
+            const float *scores = h_scores_all.data() + b * anchor_count_;
+            float max_score = *std::max_element(scores, scores + anchor_count_);
+            int   det_count = std::count_if(scores, scores + anchor_count_,
+                                            [](float s){ return s > 0.2f; });
+            const auto &s = slices_[b];
+            LOG_INFO("[PRINTMODELOUTPUTS] batch {:d} slice [{:4d},{:4d}->{:4d},{:4d}] | max_score: {:.4f} | anchors>0.2: {:d}",
+                     b, s.x1, s.y1, s.x2, s.y2, max_score, det_count);
+        }
+
+        // Detections above 0.2 for batch_selected
+        LOG_INFO("[PRINTMODELOUTPUTS] --- Detections in batch_selected={} ---", batch_selected);
+        std::vector<float4> h_bboxes   (anchor_count_);
+        std::vector<float2> h_landmarks(anchor_count_ * 5);
+        cudaMemcpy(h_bboxes.data(),
+                   device_model_output_bboxes_    + batch_selected * anchor_count_,
+                   anchor_count_ * sizeof(float4),     cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_landmarks.data(),
+                   device_model_output_landmarks_ + batch_selected * anchor_count_ * 5,
+                   anchor_count_ * 5 * sizeof(float2), cudaMemcpyDeviceToHost);
+
+        const float *sel_scores = h_scores_all.data() + batch_selected * anchor_count_;
+        for (int i = 0; i < anchor_count_; ++i) {
+            if (sel_scores[i] < 0.5f) continue;
+            LOG_INFO("  anchor {:5d} | score: {:.4f} | bbox: [{:.2f},{:.2f},{:.2f},{:.2f}] | lm0: [{:.2f},{:.2f}]",
+                i, sel_scores[i],
+                h_bboxes[i].x, h_bboxes[i].y, h_bboxes[i].z, h_bboxes[i].w,
+                h_landmarks[i * 5].x, h_landmarks[i * 5].y);
+        }
+    }
+#endif
 
 
 #ifdef DEBUG_PREPROCESS_VIS
@@ -111,25 +199,26 @@ void DetectionModelInferenceHelper::infer(const uint8_t *host_image, int batch_s
         const int H = model_input_height_;
         const int W = model_input_width_;
         const int plane = H * W;
-        const int vis_batch = std::min(batch_size, 6);
+        const int b = batch_selected;
 
-        std::vector<float> host_float(vis_batch * 3 * plane);
-        cudaMemcpy(host_float.data(), device_jetson_input_buffer_float_,
-                   vis_batch * 3 * plane * sizeof(float), cudaMemcpyDeviceToHost);
+        std::vector<float> host_float(3 * plane);
+        cudaMemcpy(host_float.data(),
+                   device_jetson_input_buffer_float_ + b * 3 * plane,
+                   3 * plane * sizeof(float), cudaMemcpyDeviceToHost);
 
-        for (int b = 0; b < vis_batch; ++b) {
-            const float *R = host_float.data() + b * 3 * plane + 0 * plane;
-            const float *G = host_float.data() + b * 3 * plane + 1 * plane;
-            const float *B = host_float.data() + b * 3 * plane + 2 * plane;
+        {
+            const float *R = host_float.data() + 0 * plane;
+            const float *G = host_float.data() + 1 * plane;
+            const float *B = host_float.data() + 2 * plane;
 
             cv::Mat img(H, W, CV_8UC3);
             for (int y = 0; y < H; ++y) {
                 for (int x = 0; x < W; ++x) {
                     int i = y * W + x;
                     img.at<cv::Vec3b>(y, x) = {
-                        static_cast<uint8_t>(B[i] * 128.0f + 127.5f),
-                        static_cast<uint8_t>(G[i] * 128.0f + 127.5f),
-                        static_cast<uint8_t>(R[i] * 128.0f + 127.5f)
+                        static_cast<uint8_t>(B[i] * 128.0f + 127.5f), // OpenCV B ← model channel 2 (B)
+                        static_cast<uint8_t>(G[i] * 128.0f + 127.5f), // OpenCV G ← model channel 1 (G)
+                        static_cast<uint8_t>(R[i] * 128.0f + 127.5f)  // OpenCV R ← model channel 0 (R)
                     };
                 }
             }
@@ -137,6 +226,7 @@ void DetectionModelInferenceHelper::infer(const uint8_t *host_image, int batch_s
             cv::imshow(win, img);
         }
         cv::waitKey(0);
+        cv::destroyAllWindows();
     }
 #endif
 }

@@ -1,7 +1,7 @@
 {
     "general": {
         "device": 0,
-        "top_k": 50,
+        "top_k": 512,
         "log_level": "debug"
     },
     "camera": {

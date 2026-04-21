@@ -41,9 +41,9 @@ __global__ void preprocessBGRToFloatCHW(const uint8_t *src, float *dst)
     int pixel        = out_y * d_dest_width + out_x;
     int batch_offset = b * 3 * plane;
 
-    dst[batch_offset + 0 * plane + pixel] = (src[src_idx + 2] - 127.5f) / 128.0f; // R
+    dst[batch_offset + 0 * plane + pixel] = (src[src_idx + 2] - 127.5f) / 128.0f; // R (src+2)
     dst[batch_offset + 1 * plane + pixel] = (src[src_idx + 1] - 127.5f) / 128.0f; // G
-    dst[batch_offset + 2 * plane + pixel] = (src[src_idx + 0] - 127.5f) / 128.0f; // B
+    dst[batch_offset + 2 * plane + pixel] = (src[src_idx + 0] - 127.5f) / 128.0f; // B (src+0)
 }
 
 
@@ -77,6 +77,17 @@ bool DetectionModelInferenceHelper::setDeviceSymbols(std::vector<int> slice_coor
     err = cudaMemcpyToSymbol(d_num_anchors,           &num_anchors,          sizeof(int));
     err = cudaMemcpyToSymbol(d_confidence_threshold,  &confidence_threshold, sizeof(float));
     err = cudaMemcpyToSymbol(d_top_k,                 &top_k,                sizeof(int));
+
+    // Verify constant memory was written correctly
+    int gpu_coords[MAX_SLICES * 4] = {};
+    cudaMemcpyFromSymbol(gpu_coords, d_slices_coordinates, sizeof(gpu_coords));
+    int n_slices = static_cast<int>(slice_coordinates.size()) / 4;
+    std::cerr << "[setDeviceSymbols] GPU d_slices_coordinates verify (" << n_slices << " slices):\n";
+    for (int i = 0; i < n_slices; ++i)
+        std::cerr << "  GPU slice " << i << ": ["
+                  << gpu_coords[i*4+0] << "," << gpu_coords[i*4+1] << " -> "
+                  << gpu_coords[i*4+2] << "," << gpu_coords[i*4+3] << "]\n";
+
     return err == cudaSuccess;
 }
 
