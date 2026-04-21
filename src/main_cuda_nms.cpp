@@ -149,13 +149,15 @@ int main()
 
                                             std::string image_path = data_config["detection"]["test_image_path"];
                                             cv::Mat img = cv::imread(image_path);
+                                            cv::resize(img, img, cv::Size(camera_width, camera_height));
                                             if (img.empty()) {
                                                 LOG_ERROR("Failed to load image: {}", image_path);
                                                 return;
                                             }
                                             auto start_time = std::chrono::high_resolution_clock::now();
-                                            for(int i = 0; i < 5000; ++i) {
-                                                inferenceHelper.infer(img.data, 1);    
+                                            const int batch = num_slices_x * num_slices_y;
+                                            for(int i = 0; i < 1; ++i) {
+                                                inferenceHelper.infer(img.data, batch);
                                             }
                                             auto end_time = std::chrono::high_resolution_clock::now();
                                             std::chrono::duration<double> elapsed = end_time - start_time;

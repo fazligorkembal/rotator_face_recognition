@@ -51,16 +51,24 @@ private:
     //Cuda & TensorRT related members
     cudaDeviceProp device_prop_ = {};
     std::string device_name_ = "";
+    std::string input_tensor_name_ = "";
     IExecutionContext *context_detection_ = nullptr;
     cudaStream_t stream_;
     bool is_discreate_gpu_ = false;
 
     // Buffers for input and output data
+    int32_t anchor_stack_ = 2;
+    size_t anchor_count_ = 0;
     size_t input_buffer_size_uint8_t_ = 0;
     size_t input_buffer_size_float_ = 0;
+    
     uint8_t *host_jetson_input_buffer_uint8_t_ = nullptr;   // mapped pinned memory, CPU writes here
     uint8_t *device_jetson_ptr_uint8_t_ = nullptr;          // GPU-side pointer to the same physical memory
     float   *device_jetson_input_buffer_float_ = nullptr;   // preprocessing output, TensorRT reads from here
+    
+    float *device_model_output_scores_ = nullptr;
+    float4 *device_model_output_bboxes_ = nullptr;
+    float2 *device_model_output_landmarks_ = nullptr;
 
     // Slicing
     std::vector<Slice> slices_ = {};
@@ -74,7 +82,7 @@ private:
     void freeBuffers();
     void computeSlices();
     std::vector<int> makePositions(int dim, int win, int gap, int num);
-    bool setDeviceSymbols(std::vector<int> slice_coordinates);
+    bool setDeviceSymbols(std::vector<int> slice_coordinates, int camera_width, int camera_height, int model_width, int model_height, int num_anchors, float confidence_threshold, int top_k);
     void launchPreprocessKernel(const uint8_t *src, float *dst, int batch, cudaStream_t stream);
 
 };

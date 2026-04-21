@@ -6,6 +6,10 @@
 #include <fstream>
 #endif
 
+#ifdef DEBUG_PREPROCESS_VIS
+#include <opencv2/opencv.hpp>
+#endif
+
 DetectionModelInferenceHelper::DetectionModelInferenceHelper(
         ICudaEngine *&engine,
         std::vector<int> batch_sizes,
@@ -48,7 +52,6 @@ DetectionModelInferenceHelper::DetectionModelInferenceHelper(
         LOG_ERROR("Expected exactly 3 batch sizes, got {}", batch_sizes.size());
         std::exit(EXIT_FAILURE);
     }
-    LOG_INFO("\n\n");
     //INFO
 
     batch_sizes_ = batch_sizes;
@@ -67,25 +70,22 @@ DetectionModelInferenceHelper::DetectionModelInferenceHelper(
 
 
     context_detection_ = engine->createExecutionContext();
-    cudaStreamCreate(&stream_);
-    allocateBuffers();
-    computeSlices();
-
-    std::vector<int> coords;
-    coords.reserve(slices_.size() * 4);
-    for (const auto &s : slices_)
-    {
-        coords.push_back(s.x1);
-        coords.push_back(s.y1);
-        coords.push_back(s.x2);
-        coords.push_back(s.y2);
-    }
-    if (!setDeviceSymbols(coords))
-    {
-        LOG_ERROR("Failed to copy slice coordinates to device constant memory");
+    if (!context_detection_) {
+        LOG_ERROR("Failed to create execution context for detection model");
         std::exit(EXIT_FAILURE);
     }
-    LOG_INFO("Slice coordinates copied to device constant memory");
+    cudaStreamCreate(&stream_);
+    allocateBuffers();
+    
+    const char *input_tensor_name = engine->getIOTensorName(0);
+    const char *output_tensor_name_scores = engine->getIOTensorName(1);
+    const char *output_tensor_name_bboxes = engine->getIOTensorName(2);
+    const char *output_tensor_name_landmarks = engine->getIOTensorName(3);
+
+    context_detection_->setTensorAddress(input_tensor_name, device_jetson_input_buffer_float_);
+    context_detection_->setTensorAddress(output_tensor_name_scores, device_model_output_scores_);
+    context_detection_->setTensorAddress(output_tensor_name_bboxes, device_model_output_bboxes_);
+    context_detection_->setTensorAddress(output_tensor_name_landmarks, device_model_output_landmarks_);
 
 }
 
@@ -95,21 +95,50 @@ DetectionModelInferenceHelper::~DetectionModelInferenceHelper(){
 }
 
 
-// Allocates GPU buffers for model inputs and outputs based on engine binding shapes
-void DetectionModelInferenceHelper::allocateBuffers() {
-    LOG_INFO("***** allocateBuffers *****");
+void DetectionModelInferenceHelper::infer(const uint8_t *host_image, int batch_size) {
+    std::memcpy(host_jetson_input_buffer_uint8_t_, host_image, input_buffer_size_uint8_t_);
+    
+    launchPreprocessKernel(device_jetson_ptr_uint8_t_, device_jetson_input_buffer_float_, batch_size, stream_);    
+    context_detection_->enqueueV3(stream_);
+    
 
-    input_buffer_size_uint8_t_ = static_cast<size_t>(camera_input_height_) * camera_input_width_ * 3;
-    input_buffer_size_float_   = static_cast<size_t>(batch_sizes_[2]) * 3 * model_input_height_ * model_input_width_;
 
-    // uint8 input: mapped pinned memory → GPU accesses same physical RAM, no PCIe transfer
-    cudaHostAlloc(&host_jetson_input_buffer_uint8_t_, input_buffer_size_uint8_t_, cudaHostAllocMapped);
-    cudaHostGetDevicePointer(&device_jetson_ptr_uint8_t_, host_jetson_input_buffer_uint8_t_, 0);
-    LOG_DEBUG("\tAllocated zero-copy uint8 input buffer: {} mb", input_buffer_size_uint8_t_ / (1024.0 * 1024.0));
+    cudaStreamSynchronize(stream_);
 
-    // float32 CHW buffer: preprocessing kernel writes here, TensorRT reads from here
-    cudaMalloc(&device_jetson_input_buffer_float_, input_buffer_size_float_ * sizeof(float));
-    LOG_DEBUG("\tAllocated device float input buffer: {} mb", input_buffer_size_float_ * sizeof(float) / (1024.0 * 1024.0));
+
+#ifdef DEBUG_PREPROCESS_VIS
+    {
+        const int H = model_input_height_;
+        const int W = model_input_width_;
+        const int plane = H * W;
+        const int vis_batch = std::min(batch_size, 6);
+
+        std::vector<float> host_float(vis_batch * 3 * plane);
+        cudaMemcpy(host_float.data(), device_jetson_input_buffer_float_,
+                   vis_batch * 3 * plane * sizeof(float), cudaMemcpyDeviceToHost);
+
+        for (int b = 0; b < vis_batch; ++b) {
+            const float *R = host_float.data() + b * 3 * plane + 0 * plane;
+            const float *G = host_float.data() + b * 3 * plane + 1 * plane;
+            const float *B = host_float.data() + b * 3 * plane + 2 * plane;
+
+            cv::Mat img(H, W, CV_8UC3);
+            for (int y = 0; y < H; ++y) {
+                for (int x = 0; x < W; ++x) {
+                    int i = y * W + x;
+                    img.at<cv::Vec3b>(y, x) = {
+                        static_cast<uint8_t>(B[i] * 128.0f + 127.5f),
+                        static_cast<uint8_t>(G[i] * 128.0f + 127.5f),
+                        static_cast<uint8_t>(R[i] * 128.0f + 127.5f)
+                    };
+                }
+            }
+            std::string win = "slice_" + std::to_string(b);
+            cv::imshow(win, img);
+        }
+        cv::waitKey(0);
+    }
+#endif
 }
 
 std::vector<int> DetectionModelInferenceHelper::makePositions(int dim, int win, int gap, int num) {
@@ -134,11 +163,71 @@ void DetectionModelInferenceHelper::computeSlices() {
         for (int x : xs)
             slices_.push_back({x, y, x + model_input_width_, y + model_input_height_});
 
-    LOG_INFO("Computed {} slices ({}x{})", slices_.size(), num_slices_x_, num_slices_y_);
+    LOG_INFO("\tComputed {} slices ({}x{})", slices_.size(), num_slices_x_, num_slices_y_);
     for (size_t i = 0; i < slices_.size(); ++i) {
         const auto &s = slices_[i];
-        LOG_DEBUG("\tSlice {}: [{},{} -> {},{}]", i, s.x1, s.y1, s.x2, s.y2);
+        LOG_DEBUG("\t\tSlice {}: [{},{} -> {},{}]", i, s.x1, s.y1, s.x2, s.y2);
     }
+}
+
+// Allocates GPU buffers for model inputs and outputs based on engine binding shapes
+void DetectionModelInferenceHelper::allocateBuffers() {
+    LOG_INFO("\t***** allocateBuffers *****");
+
+    float memory_usage = 0;
+    
+    // uint8 input: mapped pinned memory → GPU accesses same physical RAM, no PCIe transfer
+    input_buffer_size_uint8_t_ = static_cast<size_t>(camera_input_height_) * camera_input_width_ * 3 * sizeof(uint8_t);
+    cudaHostAlloc(&host_jetson_input_buffer_uint8_t_, input_buffer_size_uint8_t_, cudaHostAllocMapped);
+    cudaHostGetDevicePointer(&device_jetson_ptr_uint8_t_, host_jetson_input_buffer_uint8_t_, 0);
+    
+    memory_usage += input_buffer_size_uint8_t_ / (1024.0 * 1024.0);
+
+    // float32 CHW buffer: preprocessing kernel writes here, TensorRT reads from here
+    input_buffer_size_float_   = static_cast<size_t>(batch_sizes_[2]) * 3 * model_input_height_ * model_input_width_ * sizeof(float);
+    cudaMalloc(&device_jetson_input_buffer_float_, input_buffer_size_float_);
+    
+    memory_usage += input_buffer_size_float_ / (1024.0 * 1024.0);
+
+    for (auto stride : strides_)
+    {
+        int32_t feature_map_height = model_input_height_ / stride;
+        int32_t feature_map_width = model_input_width_ / stride;
+        int32_t anchors_per_feature_map = feature_map_height * feature_map_width;
+        anchor_count_ += anchors_per_feature_map * anchor_stack_;
+        LOG_DEBUG("\t\t\tStride {}: feature map size: {}x{}, anchors per feature map: {}, total anchors so far: {}",
+                  stride, feature_map_width, feature_map_height, anchors_per_feature_map * anchor_stack_, anchor_count_);
+    }
+    
+
+    size_t size_device_model_output_scores = batch_sizes_[2] * anchor_count_ * sizeof(float);
+    cudaMalloc(&device_model_output_scores_, size_device_model_output_scores);    
+    memory_usage += size_device_model_output_scores / (1024.0 * 1024.0);
+
+
+    int32_t size_device_model_output_bboxes = batch_sizes_[2] * anchor_count_ * sizeof(float4);
+    cudaMallocAsync(&device_model_output_bboxes_, size_device_model_output_bboxes, stream_);
+    memory_usage += size_device_model_output_bboxes / 1024.0 / 1024.0;
+
+    int32_t size_device_model_output_landmarks = batch_sizes_[2] * anchor_count_ * 5 * sizeof(float2);
+    cudaMallocAsync(&device_model_output_landmarks_, size_device_model_output_landmarks, stream_);
+    memory_usage += size_device_model_output_landmarks / 1024.0 / 1024.0;
+
+    int32_t size_device_jetson_input_buffer_float_ = batch_sizes_[2] * 3 * model_input_height_ * model_input_width_ * sizeof(float);
+    cudaMallocAsync(&device_jetson_input_buffer_float_, size_device_jetson_input_buffer_float_, stream_);
+    memory_usage += size_device_jetson_input_buffer_float_ / 1024.0 / 1024.0;
+
+    
+    LOG_DEBUG("\t\tAllocated zero-copy uint8 input buffer: {} mb", input_buffer_size_uint8_t_ / (1024.0 * 1024.0));
+    LOG_DEBUG("\t\tAllocated device float input buffer: {} mb", input_buffer_size_float_ / (1024.0 * 1024.0));
+    LOG_DEBUG("\t\tTotal anchors across all strides: {}", anchor_count_);
+    LOG_DEBUG("\t\tAllocated device buffer for model output scores: {} mb", size_device_model_output_scores / (1024.0 * 1024.0));
+    LOG_DEBUG("\t\tAllocated device buffer for model output bboxes: {} mb", size_device_model_output_bboxes / (1024.0 * 1024.0));
+    LOG_DEBUG("\t\tAllocated device buffer for model output landmarks: {} mb", size_device_model_output_landmarks / (1024.0 * 1024.0));
+    LOG_DEBUG("\tCalculated size for device float input buffer: {} mb", size_device_jetson_input_buffer_float_ / (1024.0 * 1024.0));
+    LOG_INFO("\tTotal GPU memory allocated for buffers: {} mb", memory_usage);
+    
+
 }
 
 void DetectionModelInferenceHelper::freeBuffers() {
@@ -153,15 +242,4 @@ void DetectionModelInferenceHelper::freeBuffers() {
         cudaFree(device_jetson_input_buffer_float_);
         device_jetson_input_buffer_float_ = nullptr;
     }
-}
-
-void DetectionModelInferenceHelper::infer(const uint8_t *host_image, int batch_size) {
-    std::memcpy(host_jetson_input_buffer_uint8_t_, host_image, input_buffer_size_uint8_t_);
-
-    // preprocessing: uint8 BGR HWC 1920x1080 → float32 RGB CHW 640x640, kernel handles resize
-    launchPreprocessKernel(device_jetson_ptr_uint8_t_, device_jetson_input_buffer_float_, batch_size, stream_);
-
-    cudaStreamSynchronize(stream_);
-
-    // TODO: TensorRT enqueueV3
 }

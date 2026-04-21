@@ -10,7 +10,7 @@
         "height": 1080
     },
     "detection": {
-        "model_path": "/home/user/Documents/rfr/models/det_10g_dynamic_1_6_fp16.engine",
+        "model_path": "/home/user/Documents/rfr/models/det_10g_opt_batched_1_6.engine",
         "test_image_path": "/home/user/Documents/rfr/datasets/rfr/test1.png",
         "input_size": 640,
         "conf_threshold": 0.5,

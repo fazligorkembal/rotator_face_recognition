@@ -16,18 +16,22 @@ RUN pip3 install cmake --upgrade
 WORKDIR /workspace
 
 ENV CUDNN_DIR=/usr/local/cuda
-ENV LD_LIBRARY_PATH=$CUDNN_DIR/lib64:$LD_LIBRARY_PATH
-
 ENV CUDA_HOME=/usr/local/cuda
-ENV LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=$CUDA_HOME/lib64:$CUDA_HOME/lib:$LD_LIBRARY_PATH
+ENV PATH=$CUDA_HOME/bin:$PATH
+
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=all
+ENV CUDA_CACHE_DISABLE=0
+ENV CUDA_CACHE_MAXSIZE=2147483648
 
 RUN apt-get install libopencv-dev libgtk* libspdlog-dev libfmt-dev libboost-dev ffmpeg libavformat-dev libavcodec-dev libswscale-dev pybind11-dev libxcb-xinerama0 \
     libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xfixes0 libxcb-cursor0 libyaml-cpp-dev libwebsocketpp-dev libxkbcommon-x11-0 \
     libglib2.0-0 libdbus-1-3 -y && rm -rf /var/lib/apt/lists/* 
 
 
-WORKDIR /workspace
-RUN git clone --depth=1 https://github.com/opencv/opencv.git
+# WORKDIR /workspace
+# RUN git clone --depth=1 https://github.com/opencv/opencv.git
 
 # WORKDIR /workspace
 # RUN git clone --depth=1 https://github.com/opencv/opencv.git && git clone --depth=1 https://github.com/opencv/opencv_contrib.git && cd opencv && mkdir build

@@ -193,6 +193,14 @@ bool convertToEngine(const std::string &onnxFile, const std::string &enginePath)
         return false;
     }
 
+    const char *inputName = network->getInput(0)->getName();
+    spdlog::info("Setting optimization profile for input: {}", inputName);
+    profile->setDimensions(inputName, OptProfileSelector::kMIN, Dims4{1, 3, 640, 640});
+    profile->setDimensions(inputName, OptProfileSelector::kOPT, Dims4{6, 3, 640, 640});
+    profile->setDimensions(inputName, OptProfileSelector::kMAX, Dims4{6, 3, 640, 640});
+    config->addOptimizationProfile(profile);
+    spdlog::info("Optimization profile added: min=1x3x640x640, opt=6x3x640x640, max=6x3x640x640");
+
     if (!builder->platformHasFastFp16())
     {
         spdlog::warn("FP16 not supported on this platform");
@@ -227,8 +235,8 @@ bool convertToEngine(const std::string &onnxFile, const std::string &enginePath)
 int main()
 {
     spdlog::info("Starting model conversion...");
-    std::string onnxFile = "/home/user/Documents/tensorrt_scrfd/models/det_10g_fixed_input.onnx";
-    std::string engineFile = "/home/user/Documents/tensorrt_scrfd/models/det_10g.engine";
+    std::string onnxFile = "/home/user/Documents/rfr/models/det_10g_dynamic.onnx";
+    std::string engineFile = "/home/user/Documents/rfr/models/det_10g_opt_batched_1_6.engine";
     if (convertToEngine(onnxFile, engineFile))
     {
         spdlog::info("Model conversion completed successfully.");
