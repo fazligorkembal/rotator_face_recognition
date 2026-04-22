@@ -1,14 +1,98 @@
 #include "spd_logger_helper.h"
 #include "detection_model_inference_helper.h"
+#include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <sstream>
 
-#ifdef GENERATE_TXT
+#if defined(GENERATE_TXT) || defined(LOGRESULTS)
 #include <fstream>
 #endif
 
-#ifdef DEBUG_PREPROCESS_VIS
+#ifdef LOGRESULTS
+#include <filesystem>
+#endif
+
+#if defined(DEBUG_PREPROCESS_VIS) || defined(LOGRESULTS)
 #include <opencv2/opencv.hpp>
 #endif
+
+namespace {
+
+std::string dimsToString(const nvinfer1::Dims &dims) {
+    std::ostringstream oss;
+    oss << "[";
+    for (int i = 0; i < dims.nbDims; ++i) {
+        if (i > 0) {
+            oss << ", ";
+        }
+        oss << dims.d[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+
+std::string dataTypeToString(nvinfer1::DataType type) {
+    switch (type) {
+        case nvinfer1::DataType::kFLOAT: return "kFLOAT";
+        case nvinfer1::DataType::kHALF: return "kHALF";
+        case nvinfer1::DataType::kINT8: return "kINT8";
+        case nvinfer1::DataType::kINT32: return "kINT32";
+        case nvinfer1::DataType::kBOOL: return "kBOOL";
+#if NV_TENSORRT_MAJOR >= 8
+        case nvinfer1::DataType::kUINT8: return "kUINT8";
+#endif
+#if NV_TENSORRT_MAJOR >= 10
+        case nvinfer1::DataType::kFP8: return "kFP8";
+        case nvinfer1::DataType::kBF16: return "kBF16";
+        case nvinfer1::DataType::kINT64: return "kINT64";
+#endif
+        default: return "UNKNOWN";
+    }
+}
+
+int logicalSliceToEngineBatchIndex(int logical_slice_index, int num_slices_x, int num_slices_y) {
+    if (num_slices_x <= 0 || num_slices_y <= 0) {
+        return logical_slice_index;
+    }
+
+    const int row = logical_slice_index / num_slices_x;
+    const int col = logical_slice_index % num_slices_x;
+    return col * num_slices_y + row;
+}
+
+template <typename T>
+std::vector<T> copyTensorSliceToHost(const T *device_ptr, size_t slice_index, size_t element_count) {
+    std::vector<T> host(element_count);
+    cudaMemcpy(host.data(),
+               device_ptr + slice_index * element_count,
+               element_count * sizeof(T),
+               cudaMemcpyDeviceToHost);
+    return host;
+}
+
+template <typename T>
+void reconstructTwoRowAnchorInterleave(const std::vector<T> &raw_top,
+                                       const std::vector<T> &raw_bottom,
+                                       std::vector<T> &dst,
+                                       int row,
+                                       size_t elems_per_anchor) {
+    const size_t anchor_count = dst.size() / elems_per_anchor;
+    for (size_t anchor_idx = 0; anchor_idx < anchor_count; anchor_idx += 2) {
+        const size_t even_offset = anchor_idx * elems_per_anchor;
+        const size_t odd_offset = (anchor_idx + 1) * elems_per_anchor;
+
+        if (row == 0) {
+            std::copy_n(raw_top.data() + even_offset, elems_per_anchor, dst.data() + even_offset);
+            std::copy_n(raw_bottom.data() + even_offset, elems_per_anchor, dst.data() + odd_offset);
+        } else {
+            std::copy_n(raw_top.data() + odd_offset, elems_per_anchor, dst.data() + even_offset);
+            std::copy_n(raw_bottom.data() + odd_offset, elems_per_anchor, dst.data() + odd_offset);
+        }
+    }
+}
+
+} // namespace
 
 DetectionModelInferenceHelper::DetectionModelInferenceHelper(
         ICudaEngine *&engine,
@@ -97,11 +181,6 @@ DetectionModelInferenceHelper::DetectionModelInferenceHelper(
     }
     LOG_INFO("Slice coordinates copied to device constant memory");
 
-    int nb_tensors = engine->getNbIOTensors();
-    LOG_INFO("Engine has {} IO tensors:", nb_tensors);
-    for (int i = 0; i < nb_tensors; ++i)
-        LOG_INFO("  [{}] {}", i, engine->getIOTensorName(i));
-
     const char *input_tensor_name           = engine->getIOTensorName(0);
     const char *output_tensor_name_scores   = engine->getIOTensorName(1);
     const char *output_tensor_name_bboxes   = engine->getIOTensorName(2);
@@ -113,6 +192,29 @@ DetectionModelInferenceHelper::DetectionModelInferenceHelper(
     context_detection_->setTensorAddress(output_tensor_name_landmarks, device_model_output_landmarks_);
 
     context_detection_->setInputShape(input_tensor_name, nvinfer1::Dims4{batch_sizes_[1], 3, model_input_height_, model_input_width_});
+
+    int nb_tensors = engine->getNbIOTensors();
+    LOG_DEBUG("Engine has {} IO tensors:", nb_tensors);
+    for (int i = 0; i < nb_tensors; ++i) {
+        const char *tensor_name = engine->getIOTensorName(i);
+        const auto engine_dims = engine->getTensorShape(tensor_name);
+        const auto context_dims = context_detection_->getTensorShape(tensor_name);
+        const auto dtype = engine->getTensorDataType(tensor_name);
+        const auto bytes_per_component = engine->getTensorBytesPerComponent(tensor_name);
+        const auto components_per_element = engine->getTensorComponentsPerElement(tensor_name);
+        const auto vectorized_dim = engine->getTensorVectorizedDim(tensor_name);
+        const char *format_desc = engine->getTensorFormatDesc(tensor_name);
+        LOG_DEBUG("  [{}] {} | engine_dims={} | context_dims={} | dtype={} | bytes/component={} | components/element={} | vectorized_dim={} | format={}",
+                  i,
+                  tensor_name,
+                  dimsToString(engine_dims),
+                  dimsToString(context_dims),
+                  dataTypeToString(dtype),
+                  bytes_per_component,
+                  components_per_element,
+                  vectorized_dim,
+                  format_desc ? format_desc : "<null>");
+    }
 
 }
 
@@ -130,105 +232,214 @@ void DetectionModelInferenceHelper::infer(const uint8_t *host_image, int batch_s
 
     cudaStreamSynchronize(stream_);
 
-size_t batch_selected = 4;
-#ifdef PRINTMODELOUTPUTS
-    // Verify preprocessed input: read pixel (0,0) from each batch's float buffer.
-    // Expected value = (src[y1*cam_w + x1] channel R - 127.5) / 128.0
-    {
-        int plane = model_input_height_ * model_input_width_;
-        std::vector<float> px(batch_size);
-        for (int b = 0; b < batch_size; ++b) {
-            cudaMemcpy(&px[b],
-                       device_jetson_input_buffer_float_ + b * 3 * plane,
-                       sizeof(float), cudaMemcpyDeviceToHost);
-        }
-        LOG_INFO("[PREPROCESS_VERIFY] pixel(0,0) R-channel of preprocessed float buffer:");
-        for (int b = 0; b < batch_size; ++b) {
-            const auto &s = slices_[b];
-            // Expected: R channel at (s.x1, s.y1) of source image
-            const uint8_t *src = host_jetson_input_buffer_uint8_t_;
-            float expected = (src[(s.y1 * camera_input_width_ + s.x1) * 3 + 2] - 127.5f) / 128.0f;
-            LOG_INFO("  batch {:d} slice [{:4d},{:4d}] | gpu_pixel: {:.4f} | expected: {:.4f} | match: {}",
-                     b, s.x1, s.y1, px[b], expected, std::abs(px[b] - expected) < 1e-4f ? "YES" : "NO");
-        }
-    }
-#endif
-#ifdef PRINTMODELOUTPUTS
-    {
-        int total_batches = batch_sizes_[1];
-        std::vector<float> h_scores_all(total_batches * anchor_count_);
-        cudaMemcpy(h_scores_all.data(), device_model_output_scores_,
-                   total_batches * anchor_count_ * sizeof(float), cudaMemcpyDeviceToHost);
-
-        // Per-batch: max score + detections above threshold
-        for (int b = 0; b < total_batches; ++b) {
-            const float *scores = h_scores_all.data() + b * anchor_count_;
-            float max_score = *std::max_element(scores, scores + anchor_count_);
-            int   det_count = std::count_if(scores, scores + anchor_count_,
-                                            [](float s){ return s > 0.2f; });
-            const auto &s = slices_[b];
-            LOG_INFO("[PRINTMODELOUTPUTS] batch {:d} slice [{:4d},{:4d}->{:4d},{:4d}] | max_score: {:.4f} | anchors>0.2: {:d}",
-                     b, s.x1, s.y1, s.x2, s.y2, max_score, det_count);
-        }
-
-        // Detections above 0.2 for batch_selected
-        LOG_INFO("[PRINTMODELOUTPUTS] --- Detections in batch_selected={} ---", batch_selected);
-        std::vector<float4> h_bboxes   (anchor_count_);
-        std::vector<float2> h_landmarks(anchor_count_ * 5);
-        cudaMemcpy(h_bboxes.data(),
-                   device_model_output_bboxes_    + batch_selected * anchor_count_,
-                   anchor_count_ * sizeof(float4),     cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_landmarks.data(),
-                   device_model_output_landmarks_ + batch_selected * anchor_count_ * 5,
-                   anchor_count_ * 5 * sizeof(float2), cudaMemcpyDeviceToHost);
-
-        const float *sel_scores = h_scores_all.data() + batch_selected * anchor_count_;
-        for (int i = 0; i < anchor_count_; ++i) {
-            if (sel_scores[i] < 0.5f) continue;
-            LOG_INFO("  anchor {:5d} | score: {:.4f} | bbox: [{:.2f},{:.2f},{:.2f},{:.2f}] | lm0: [{:.2f},{:.2f}]",
-                i, sel_scores[i],
-                h_bboxes[i].x, h_bboxes[i].y, h_bboxes[i].z, h_bboxes[i].w,
-                h_landmarks[i * 5].x, h_landmarks[i * 5].y);
-        }
-    }
-#endif
-
-
-#ifdef DEBUG_PREPROCESS_VIS
+#ifdef LOGRESULTS
     {
         const int H = model_input_height_;
         const int W = model_input_width_;
         const int plane = H * W;
-        const int b = batch_selected;
+        const int num_elements = 3 * plane;
+        const int num_slices = std::min(batch_size, num_slices_x_ * num_slices_y_);
+        const bool use_column_major_output_order_fix =
+            batch_size == num_slices_x_ * num_slices_y_ && batch_size > 1;
+        const bool use_two_row_anchor_reconstruction =
+            use_column_major_output_order_fix && num_slices_y_ == anchor_stack_;
 
-        std::vector<float> host_float(3 * plane);
-        cudaMemcpy(host_float.data(),
-                   device_jetson_input_buffer_float_ + b * 3 * plane,
-                   3 * plane * sizeof(float), cudaMemcpyDeviceToHost);
+        std::filesystem::path build_dir = std::filesystem::current_path();
+        if (build_dir.filename() != "build") {
+            build_dir /= "build";
+        }
+        std::filesystem::create_directories(build_dir);
+        const cv::Mat full_frame(camera_input_height_, camera_input_width_, CV_8UC3,
+                                 const_cast<uint8_t *>(host_image));
+        cv::Mat full_vis = full_frame.clone();
 
-        {
-            const float *R = host_float.data() + 0 * plane;
-            const float *G = host_float.data() + 1 * plane;
-            const float *B = host_float.data() + 2 * plane;
+        for (int b = 0; b < num_slices; ++b) {
+            const int engine_batch_index =
+                use_column_major_output_order_fix ? logicalSliceToEngineBatchIndex(b, num_slices_x_, num_slices_y_) : b;
+            const auto &slice = slices_[b];
+            std::vector<float> host_float(num_elements);
+            cudaMemcpy(host_float.data(),
+                       device_jetson_input_buffer_float_ + b * num_elements,
+                       num_elements * sizeof(float),
+                       cudaMemcpyDeviceToHost);
 
-            cv::Mat img(H, W, CV_8UC3);
-            for (int y = 0; y < H; ++y) {
-                for (int x = 0; x < W; ++x) {
-                    int i = y * W + x;
-                    img.at<cv::Vec3b>(y, x) = {
-                        static_cast<uint8_t>(B[i] * 128.0f + 127.5f), // OpenCV B ← model channel 2 (B)
-                        static_cast<uint8_t>(G[i] * 128.0f + 127.5f), // OpenCV G ← model channel 1 (G)
-                        static_cast<uint8_t>(R[i] * 128.0f + 127.5f)  // OpenCV R ← model channel 0 (R)
-                    };
+            {
+                std::ofstream ofs(build_dir / ("engine_input_slice" + std::to_string(b) + ".txt"));
+                for (int i = 0; i < num_elements; ++i) {
+                    ofs << host_float[i] << "\n";
                 }
             }
-            std::string win = "slice_" + std::to_string(b);
-            cv::imshow(win, img);
+
+            {
+                const float *R = host_float.data() + 0 * plane;
+                const float *G = host_float.data() + 1 * plane;
+                const float *B = host_float.data() + 2 * plane;
+                cv::Mat img(H, W, CV_8UC3);
+                for (int y = 0; y < H; ++y) {
+                    for (int x = 0; x < W; ++x) {
+                        const int i = y * W + x;
+                        img.at<cv::Vec3b>(y, x) = {
+                            static_cast<uint8_t>(std::clamp(B[i] * 128.0f + 127.5f, 0.0f, 255.0f)),
+                            static_cast<uint8_t>(std::clamp(G[i] * 128.0f + 127.5f, 0.0f, 255.0f)),
+                            static_cast<uint8_t>(std::clamp(R[i] * 128.0f + 127.5f, 0.0f, 255.0f))
+                        };
+                    }
+                }
+                cv::imwrite((build_dir / ("engine_input_slice" + std::to_string(b) + ".png")).string(), img);
+            }
+
+            std::vector<float> host_scores(anchor_count_);
+            std::vector<float4> host_bboxes(anchor_count_);
+            std::vector<float2> host_landmarks(anchor_count_ * 5);
+
+            if (use_two_row_anchor_reconstruction) {
+                const int row = b / num_slices_x_;
+                const int col = b % num_slices_x_;
+                const int top_logical_slice = col;
+                const int bottom_logical_slice = col + num_slices_x_;
+                const int top_engine_batch_index =
+                    logicalSliceToEngineBatchIndex(top_logical_slice, num_slices_x_, num_slices_y_);
+                const int bottom_engine_batch_index =
+                    logicalSliceToEngineBatchIndex(bottom_logical_slice, num_slices_x_, num_slices_y_);
+
+                const auto raw_top_scores =
+                    copyTensorSliceToHost(device_model_output_scores_, static_cast<size_t>(top_engine_batch_index), anchor_count_);
+                const auto raw_bottom_scores =
+                    copyTensorSliceToHost(device_model_output_scores_, static_cast<size_t>(bottom_engine_batch_index), anchor_count_);
+                const auto raw_top_bboxes =
+                    copyTensorSliceToHost(device_model_output_bboxes_, static_cast<size_t>(top_engine_batch_index), anchor_count_);
+                const auto raw_bottom_bboxes =
+                    copyTensorSliceToHost(device_model_output_bboxes_, static_cast<size_t>(bottom_engine_batch_index), anchor_count_);
+                const auto raw_top_landmarks =
+                    copyTensorSliceToHost(device_model_output_landmarks_, static_cast<size_t>(top_engine_batch_index), anchor_count_ * 5);
+                const auto raw_bottom_landmarks =
+                    copyTensorSliceToHost(device_model_output_landmarks_, static_cast<size_t>(bottom_engine_batch_index), anchor_count_ * 5);
+
+                reconstructTwoRowAnchorInterleave(raw_top_scores, raw_bottom_scores, host_scores, row, 1);
+                reconstructTwoRowAnchorInterleave(raw_top_bboxes, raw_bottom_bboxes, host_bboxes, row, 1);
+                reconstructTwoRowAnchorInterleave(raw_top_landmarks, raw_bottom_landmarks, host_landmarks, row, 5);
+            } else {
+                cudaMemcpy(host_scores.data(),
+                           device_model_output_scores_ + static_cast<size_t>(engine_batch_index) * anchor_count_,
+                           anchor_count_ * sizeof(float),
+                           cudaMemcpyDeviceToHost);
+                cudaMemcpy(host_bboxes.data(),
+                           device_model_output_bboxes_ + static_cast<size_t>(engine_batch_index) * anchor_count_,
+                           anchor_count_ * sizeof(float4),
+                           cudaMemcpyDeviceToHost);
+                cudaMemcpy(host_landmarks.data(),
+                           device_model_output_landmarks_ + static_cast<size_t>(engine_batch_index) * anchor_count_ * 5,
+                           anchor_count_ * 5 * sizeof(float2),
+                           cudaMemcpyDeviceToHost);
+            }
+
+            {
+                std::ofstream sofs(build_dir / ("engine_output_slice" + std::to_string(b) + "_scores.txt"));
+                for (size_t i = 0; i < anchor_count_; ++i) {
+                    sofs << host_scores[i] << "\n";
+                }
+            }
+
+            {
+                std::ofstream bofs(build_dir / ("engine_output_slice" + std::to_string(b) + "_bboxes.txt"));
+                std::ofstream lofs(build_dir / ("engine_output_slice" + std::to_string(b) + "_landmarks.txt"));
+                cv::Mat slice_vis = full_frame(cv::Rect(slice.x1, slice.y1, W, H)).clone();
+                int drawn_boxes = 0;
+
+                size_t anchor_offset = 0;
+                for (auto stride : strides_) {
+                    const int feature_map_height = model_input_height_ / stride;
+                    const int feature_map_width = model_input_width_ / stride;
+                    const size_t anchors_this_stride =
+                        static_cast<size_t>(feature_map_height) * feature_map_width * anchor_stack_;
+
+                    for (int y = 0; y < feature_map_height; ++y) {
+                        for (int x = 0; x < feature_map_width; ++x) {
+                            for (int a = 0; a < anchor_stack_; ++a) {
+                                const size_t idx =
+                                    anchor_offset + (static_cast<size_t>(y) * feature_map_width + x) * anchor_stack_ + a;
+                                const float cx = static_cast<float>(x * stride);
+                                const float cy = static_cast<float>(y * stride);
+
+                                const float l = host_bboxes[idx].x * stride;
+                                const float t = host_bboxes[idx].y * stride;
+                                const float r = host_bboxes[idx].z * stride;
+                                const float bb = host_bboxes[idx].w * stride;
+                                const float score = host_scores[idx];
+
+                                const float x1 = cx - l;
+                                const float y1 = cy - t;
+                                const float x2 = cx + r;
+                                const float y2 = cy + bb;
+
+                                bofs << x1 << "\n";
+                                bofs << y1 << "\n";
+                                bofs << x2 << "\n";
+                                bofs << y2 << "\n";
+
+                                for (int kp = 0; kp < 5; ++kp) {
+                                    const float2 &raw_kp = host_landmarks[idx * 5 + kp];
+                                    const float kp_x = cx + raw_kp.x * stride;
+                                    const float kp_y = cy + raw_kp.y * stride;
+                                    lofs << kp_x << "\n";
+                                    lofs << kp_y << "\n";
+
+                                    if (score >= confidence_threshold_) {
+                                        cv::circle(slice_vis,
+                                                   cv::Point(static_cast<int>(std::round(kp_x)),
+                                                             static_cast<int>(std::round(kp_y))),
+                                                   2, cv::Scalar(255, 0, 0), -1);
+                                        cv::circle(full_vis,
+                                                   cv::Point(slice.x1 + static_cast<int>(std::round(kp_x)),
+                                                             slice.y1 + static_cast<int>(std::round(kp_y))),
+                                                   2, cv::Scalar(255, 0, 0), -1);
+                                    }
+                                }
+
+                                if (score >= confidence_threshold_) {
+                                    const cv::Point slice_tl(static_cast<int>(std::round(x1)), static_cast<int>(std::round(y1)));
+                                    const cv::Point slice_br(static_cast<int>(std::round(x2)), static_cast<int>(std::round(y2)));
+                                    const cv::Point full_tl(slice.x1 + slice_tl.x, slice.y1 + slice_tl.y);
+                                    const cv::Point full_br(slice.x1 + slice_br.x, slice.y1 + slice_br.y);
+
+                                    cv::rectangle(slice_vis, slice_tl, slice_br, cv::Scalar(0, 255, 0), 2);
+                                    cv::rectangle(full_vis, full_tl, full_br, cv::Scalar(0, 255, 0), 2);
+                                    cv::putText(slice_vis, cv::format("%.2f", score),
+                                                cv::Point(slice_tl.x, std::max(12, slice_tl.y - 4)),
+                                                cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 0, 255), 1);
+                                    cv::putText(full_vis, cv::format("%.2f", score),
+                                                cv::Point(full_tl.x, std::max(12, full_tl.y - 4)),
+                                                cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 0, 255), 1);
+                                    ++drawn_boxes;
+                                }
+                            }
+                        }
+                    }
+
+                    anchor_offset += anchors_this_stride;
+                }
+
+                cv::putText(slice_vis, cv::format("slice %d", b), cv::Point(6, 22),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
+                cv::imwrite((build_dir / ("engine_slice" + std::to_string(b) + "_detections.png")).string(), slice_vis);
+                LOG_INFO("LOGRESULTS saved engine_slice{}_detections.png with {} boxes >= {:.2f}",
+                         b, drawn_boxes, confidence_threshold_);
+            }
         }
-        cv::waitKey(0);
-        cv::destroyAllWindows();
+
+        for (const auto &slice : slices_) {
+            cv::rectangle(full_vis, cv::Point(slice.x1, slice.y1), cv::Point(slice.x2, slice.y2),
+                          cv::Scalar(255, 255, 0), 1);
+        }
+        cv::imwrite((build_dir / "engine_detections_full.png").string(), full_vis);
+
+        LOG_INFO("LOGRESULTS wrote per-slice inputs and outputs to {}{}", build_dir.string(),
+                 use_two_row_anchor_reconstruction
+                     ? " (output batch order remapped and anchor pairs reconstructed across 2 slice rows)"
+                     : (use_column_major_output_order_fix ? " (output batch order remapped column-major -> row-major)" : ""));
     }
 #endif
+
 }
 
 std::vector<int> DetectionModelInferenceHelper::makePositions(int dim, int win, int gap, int num) {

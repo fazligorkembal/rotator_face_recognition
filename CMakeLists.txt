@@ -47,20 +47,9 @@ add_executable(modeldetection_model_converter src/converters/detection_model_con
 target_link_libraries(modeldetection_model_converter PRIVATE ${COMMON_LIBS})
 
 
-option(DEBUG_PREPROCESS_VIS "Show preprocessed slices via OpenCV imshow" OFF)
-if(DEBUG_PREPROCESS_VIS)
-    target_compile_definitions(main PRIVATE DEBUG_PREPROCESS_VIS)
-    message("${ESC}[1;33m[DEBUG] DEBUG_PREPROCESS_VIS enabled${ESC}[0m")
+option(LOGRESULTS "Show preprocessed slices via OpenCV imshow" OFF)
+if(LOGRESULTS)
+    target_compile_definitions(main PRIVATE LOGRESULTS)
+    message("${ESC}[1;33m[DEBUG] LOGRESULTS enabled${ESC}[0m")
 endif()
 
-option(DEBUG_FILTER_SORT "Print filtered/sorted scores and anchor indexes after NMS" OFF)
-if(DEBUG_FILTER_SORT)
-    target_compile_definitions(main PRIVATE DEBUG_FILTER_SORT)
-    message("${ESC}[1;33m[DEBUG] DEBUG_FILTER_SORT enabled${ESC}[0m")
-endif()
-
-option(PRINTMODELOUTPUTS "Download and print batch-0 model outputs (scores, bboxes, landmarks) after inference" OFF)
-if(PRINTMODELOUTPUTS)
-    target_compile_definitions(main PRIVATE PRINTMODELOUTPUTS)
-    message("${ESC}[1;33m[DEBUG] PRINTMODELOUTPUTS enabled${ESC}[0m")
-endif()

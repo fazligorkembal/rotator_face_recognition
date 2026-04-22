@@ -78,10 +78,10 @@ bool convertToEngine(const std::string &onnxFile, const std::string &enginePath)
     }
 
     auto nbInputs = network->getNbInputs();
-    spdlog::info("ONNX model has {} inputs", nbInputs);
+    spdlog::info("ONNX parser graph has {} inputs", nbInputs);
 
     auto nbOutputs = network->getNbOutputs();
-    spdlog::info("ONNX model has {} outputs", nbOutputs);
+    spdlog::info("ONNX parser graph has {} outputs", nbOutputs);
 
     for (int output = 0; output < nbOutputs; ++output)
     {
@@ -95,35 +95,63 @@ bool convertToEngine(const std::string &onnxFile, const std::string &enginePath)
                 shape += ", ";
         }
         shape += "]";
-        spdlog::info("{} - Output Name: {}, Shape: {}, Type: {}", output, outputTensor->getName(), shape, static_cast<int>(outputTensor->getType()));
+        spdlog::info("Raw ONNX output {} - Name: {}, Shape: {}, Type: {}", output, outputTensor->getName(), shape, static_cast<int>(outputTensor->getType()));
     }
 
-    ITensor *classes[] = {network->getOutput(0), network->getOutput(1), network->getOutput(2)};
-    ITensor *bboxes[] = {network->getOutput(3), network->getOutput(4), network->getOutput(5)};
-    ITensor *landmarks[] = {network->getOutput(6), network->getOutput(7), network->getOutput(8)};
+    auto reshape_head = [&](ITensor *tensor, const char *layer_name, int anchors, int channels) -> ITensor * {
+        auto shuffle = network->addShuffle(*tensor);
+        if (!shuffle)
+        {
+            throw std::runtime_error(std::string("Failed to create shuffle layer: ") + layer_name);
+        }
+        shuffle->setName(layer_name);
 
-    for (int output = 0; output < nbOutputs; ++output)
+        // Dynamic SCRFD heads arrive flattened as [anchors * batch, channels], but the
+        // flattened order is anchor-major with batch interleaved. Rebuild them as
+        // [anchors, batch, channels] first, then transpose to [batch, anchors, channels].
+        shuffle->setReshapeDimensions(Dims3{anchors, -1, channels});
+        shuffle->setSecondTranspose(Permutation{1, 0, 2});
+        return shuffle->getOutput(0);
+    };
+
+    ITensor *classes[] = {
+        reshape_head(network->getOutput(0), "reshape_cls_s8", 12800, 1),
+        reshape_head(network->getOutput(1), "reshape_cls_s16", 3200, 1),
+        reshape_head(network->getOutput(2), "reshape_cls_s32", 800, 1)};
+    ITensor *bboxes[] = {
+        reshape_head(network->getOutput(3), "reshape_bbox_s8", 12800, 4),
+        reshape_head(network->getOutput(4), "reshape_bbox_s16", 3200, 4),
+        reshape_head(network->getOutput(5), "reshape_bbox_s32", 800, 4)};
+    ITensor *landmarks[] = {
+        reshape_head(network->getOutput(6), "reshape_lmk_s8", 12800, 10),
+        reshape_head(network->getOutput(7), "reshape_lmk_s16", 3200, 10),
+        reshape_head(network->getOutput(8), "reshape_lmk_s32", 800, 10)};
+
+    while (network->getNbOutputs() > 0)
     {
         network->unmarkOutput(*network->getOutput(0));
     }
 
     auto concat_classes = network->addConcatenation(classes, 3);
     concat_classes->setName("concat_classes_layer");
+    concat_classes->setAxis(1);
     concat_classes->getOutput(0)->setName("output_concat_classes");
     network->markOutput(*concat_classes->getOutput(0));
 
     auto concat_bboxes = network->addConcatenation(bboxes, 3);
     concat_bboxes->setName("concat_bboxes_layer");
+    concat_bboxes->setAxis(1);
     concat_bboxes->getOutput(0)->setName("output_concat_bboxes");
     network->markOutput(*concat_bboxes->getOutput(0));
 
     auto concat_landmarks = network->addConcatenation(landmarks, 3);
     concat_landmarks->setName("concat_landmarks_layer");
+    concat_landmarks->setAxis(1);
     concat_landmarks->getOutput(0)->setName("output_concat_landmarks");
     network->markOutput(*concat_landmarks->getOutput(0));
 
     nbOutputs = network->getNbOutputs();
-    spdlog::info("ONNX model has {} outputs", nbOutputs);
+    spdlog::info("TensorRT network has {} outputs after reshape+concat", nbOutputs);
 
     for (int output = 0; output < nbOutputs; ++output)
     {
@@ -137,8 +165,26 @@ bool convertToEngine(const std::string &onnxFile, const std::string &enginePath)
                 shape += ", ";
         }
         shape += "]";
-        spdlog::info("Output Name: {}, Shape: {}, Type: {}", outputTensor->getName(), shape, static_cast<int>(outputTensor->getType()));
+        spdlog::info("TensorRT output {} - Name: {}, Shape: {}, Type: {}", output, outputTensor->getName(), shape, static_cast<int>(outputTensor->getType()));
     }
+
+    const auto assert_output_shape = [&](int output_index, const char *name, int expected_anchors, int expected_channels) {
+        auto *tensor = network->getOutput(output_index);
+        auto dims = tensor->getDimensions();
+        if (dims.nbDims != 3) {
+            throw std::runtime_error(std::string("Expected 3D output for ") + name + ", got nbDims=" + std::to_string(dims.nbDims));
+        }
+        if (dims.d[1] != expected_anchors) {
+            throw std::runtime_error(std::string("Unexpected anchor dimension for ") + name + ": got " + std::to_string(dims.d[1]) + ", expected " + std::to_string(expected_anchors));
+        }
+        if (dims.d[2] != expected_channels) {
+            throw std::runtime_error(std::string("Unexpected channel dimension for ") + name + ": got " + std::to_string(dims.d[2]) + ", expected " + std::to_string(expected_channels));
+        }
+    };
+
+    assert_output_shape(0, "output_concat_classes", 16800, 1);
+    assert_output_shape(1, "output_concat_bboxes", 16800, 4);
+    assert_output_shape(2, "output_concat_landmarks", 16800, 10);
 
     const auto numInputs = network->getNbInputs();
     if (numInputs < 1)
@@ -236,7 +282,7 @@ int main()
 {
     spdlog::info("Starting model conversion...");
     std::string onnxFile = "/home/user/Documents/rfr/models/det_10g_dynamic.onnx";
-    std::string engineFile = "/home/user/Documents/rfr/models/det_10g_opt_batched_1_6.engine";
+    std::string engineFile = "/home/user/Documents/rfr/models/det_10g_dynamic.engine";
     if (convertToEngine(onnxFile, engineFile))
     {
         spdlog::info("Model conversion completed successfully.");
