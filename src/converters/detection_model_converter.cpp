@@ -2,6 +2,7 @@
 #include <NvInferPlugin.h>
 #include <cuda_runtime.h>
 #include <spdlog/spdlog.h>
+#include <array>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -20,6 +21,62 @@ class Logger : public ILogger
             spdlog::info("[TensorRT] {}", msg);
     }
 } gLogger;
+
+namespace
+{
+
+struct OutputLayoutSpec
+{
+    int anchors;
+    int channels;
+};
+
+ITensor *normalizeRawHeadOutput(INetworkDefinition &network,
+                                ITensor &raw_output,
+                                const std::string &raw_name,
+                                int anchors,
+                                int channels)
+{
+    const int anchor_stack = 2;
+    if (anchors % anchor_stack != 0)
+    {
+        throw std::runtime_error("Anchor count must be divisible by anchor_stack");
+    }
+
+    const auto dims = raw_output.getDimensions();
+    if (dims.nbDims != 2 || dims.d[1] != channels)
+    {
+        throw std::runtime_error("Unexpected raw SCRFD output shape for " + raw_name);
+    }
+
+    const int cells = anchors / anchor_stack;
+
+    auto *shuffle_to_4d = network.addShuffle(raw_output);
+    if (!shuffle_to_4d)
+    {
+        throw std::runtime_error("Failed to create shuffle_to_4d for " + raw_name);
+    }
+    shuffle_to_4d->setName((raw_name + "_cell_batch_anchor").c_str());
+    shuffle_to_4d->setReshapeDimensions(Dims4{cells, -1, anchor_stack, channels});
+    Permutation batch_major_permutation{};
+    batch_major_permutation.order[0] = 1;
+    batch_major_permutation.order[1] = 0;
+    batch_major_permutation.order[2] = 2;
+    batch_major_permutation.order[3] = 3;
+    shuffle_to_4d->setSecondTranspose(batch_major_permutation);
+
+    auto *shuffle_to_3d = network.addShuffle(*shuffle_to_4d->getOutput(0));
+    if (!shuffle_to_3d)
+    {
+        throw std::runtime_error("Failed to create shuffle_to_3d for " + raw_name);
+    }
+    shuffle_to_3d->setName((raw_name + "_batch_major").c_str());
+    shuffle_to_3d->setReshapeDimensions(Dims3{-1, anchors, channels});
+
+    return shuffle_to_3d->getOutput(0);
+}
+
+} // namespace
 
 bool convertToEngine(const std::string &onnxFile, const std::string &enginePath)
 
@@ -98,60 +155,55 @@ bool convertToEngine(const std::string &onnxFile, const std::string &enginePath)
         spdlog::info("Raw ONNX output {} - Name: {}, Shape: {}, Type: {}", output, outputTensor->getName(), shape, static_cast<int>(outputTensor->getType()));
     }
 
-    auto reshape_head = [&](ITensor *tensor, const char *layer_name, int anchors, int channels) -> ITensor * {
-        auto shuffle = network->addShuffle(*tensor);
-        if (!shuffle)
-        {
-            throw std::runtime_error(std::string("Failed to create shuffle layer: ") + layer_name);
-        }
-        shuffle->setName(layer_name);
-
-        // Dynamic SCRFD heads arrive flattened as [anchors * batch, channels], but the
-        // flattened order is anchor-major with batch interleaved. Rebuild them as
-        // [anchors, batch, channels] first, then transpose to [batch, anchors, channels].
-        shuffle->setReshapeDimensions(Dims3{anchors, -1, channels});
-        shuffle->setSecondTranspose(Permutation{1, 0, 2});
-        return shuffle->getOutput(0);
-    };
-
-    ITensor *classes[] = {
-        reshape_head(network->getOutput(0), "reshape_cls_s8", 12800, 1),
-        reshape_head(network->getOutput(1), "reshape_cls_s16", 3200, 1),
-        reshape_head(network->getOutput(2), "reshape_cls_s32", 800, 1)};
-    ITensor *bboxes[] = {
-        reshape_head(network->getOutput(3), "reshape_bbox_s8", 12800, 4),
-        reshape_head(network->getOutput(4), "reshape_bbox_s16", 3200, 4),
-        reshape_head(network->getOutput(5), "reshape_bbox_s32", 800, 4)};
-    ITensor *landmarks[] = {
-        reshape_head(network->getOutput(6), "reshape_lmk_s8", 12800, 10),
-        reshape_head(network->getOutput(7), "reshape_lmk_s16", 3200, 10),
-        reshape_head(network->getOutput(8), "reshape_lmk_s32", 800, 10)};
-
-    while (network->getNbOutputs() > 0)
+    if (nbOutputs != 9)
     {
-        network->unmarkOutput(*network->getOutput(0));
+        throw std::runtime_error("Expected 9 raw SCRFD outputs from ONNX parser");
     }
 
-    auto concat_classes = network->addConcatenation(classes, 3);
-    concat_classes->setName("concat_classes_layer");
-    concat_classes->setAxis(1);
-    concat_classes->getOutput(0)->setName("output_concat_classes");
-    network->markOutput(*concat_classes->getOutput(0));
+    const std::array<OutputLayoutSpec, 9> output_specs = {{
+        {12800, 1},
+        {3200, 1},
+        {800, 1},
+        {12800, 4},
+        {3200, 4},
+        {800, 4},
+        {12800, 10},
+        {3200, 10},
+        {800, 10},
+    }};
 
-    auto concat_bboxes = network->addConcatenation(bboxes, 3);
-    concat_bboxes->setName("concat_bboxes_layer");
-    concat_bboxes->setAxis(1);
-    concat_bboxes->getOutput(0)->setName("output_concat_bboxes");
-    network->markOutput(*concat_bboxes->getOutput(0));
+    spdlog::info("Normalizing {} raw ONNX outputs to batch-major [batch, anchors, channels]", nbOutputs);
 
-    auto concat_landmarks = network->addConcatenation(landmarks, 3);
-    concat_landmarks->setName("concat_landmarks_layer");
-    concat_landmarks->setAxis(1);
-    concat_landmarks->getOutput(0)->setName("output_concat_landmarks");
-    network->markOutput(*concat_landmarks->getOutput(0));
+    std::array<ITensor *, 9> raw_outputs{};
+    std::array<ITensor *, 9> normalized_outputs{};
+    std::array<std::string, 9> raw_names{};
 
-    nbOutputs = network->getNbOutputs();
-    spdlog::info("TensorRT network has {} outputs after reshape+concat", nbOutputs);
+    for (int output = 0; output < nbOutputs; ++output)
+    {
+        raw_outputs[output] = network->getOutput(output);
+        raw_names[output] = raw_outputs[output]->getName();
+    }
+
+    for (int output = 0; output < nbOutputs; ++output)
+    {
+        normalized_outputs[output] = normalizeRawHeadOutput(
+            *network,
+            *raw_outputs[output],
+            raw_names[output],
+            output_specs[output].anchors,
+            output_specs[output].channels);
+    }
+
+    for (int output = 0; output < nbOutputs; ++output)
+    {
+        network->unmarkOutput(*raw_outputs[output]);
+    }
+
+    for (int output = 0; output < nbOutputs; ++output)
+    {
+        normalized_outputs[output]->setName(raw_names[output].c_str());
+        network->markOutput(*normalized_outputs[output]);
+    }
 
     for (int output = 0; output < nbOutputs; ++output)
     {
@@ -167,24 +219,6 @@ bool convertToEngine(const std::string &onnxFile, const std::string &enginePath)
         shape += "]";
         spdlog::info("TensorRT output {} - Name: {}, Shape: {}, Type: {}", output, outputTensor->getName(), shape, static_cast<int>(outputTensor->getType()));
     }
-
-    const auto assert_output_shape = [&](int output_index, const char *name, int expected_anchors, int expected_channels) {
-        auto *tensor = network->getOutput(output_index);
-        auto dims = tensor->getDimensions();
-        if (dims.nbDims != 3) {
-            throw std::runtime_error(std::string("Expected 3D output for ") + name + ", got nbDims=" + std::to_string(dims.nbDims));
-        }
-        if (dims.d[1] != expected_anchors) {
-            throw std::runtime_error(std::string("Unexpected anchor dimension for ") + name + ": got " + std::to_string(dims.d[1]) + ", expected " + std::to_string(expected_anchors));
-        }
-        if (dims.d[2] != expected_channels) {
-            throw std::runtime_error(std::string("Unexpected channel dimension for ") + name + ": got " + std::to_string(dims.d[2]) + ", expected " + std::to_string(expected_channels));
-        }
-    };
-
-    assert_output_shape(0, "output_concat_classes", 16800, 1);
-    assert_output_shape(1, "output_concat_bboxes", 16800, 4);
-    assert_output_shape(2, "output_concat_landmarks", 16800, 10);
 
     const auto numInputs = network->getNbInputs();
     if (numInputs < 1)

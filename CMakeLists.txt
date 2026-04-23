@@ -52,4 +52,3 @@ if(LOGRESULTS)
     target_compile_definitions(main PRIVATE LOGRESULTS)
     message("${ESC}[1;33m[DEBUG] LOGRESULTS enabled${ESC}[0m")
 endif()
-

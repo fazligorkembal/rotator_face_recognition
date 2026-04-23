@@ -4,6 +4,8 @@
 #include <vector>
 #include <cmath>
 #include <fstream>
+#include <stdexcept>
+#include <string_view>
 
 #include <opencv2/opencv.hpp>
 #include "tensorrt/logging.h"
@@ -32,6 +34,37 @@ Logger gLogger(Severity::kINFO);
 
 using namespace nvinfer1;
 using namespace cv;
+
+namespace {
+
+void printUsage(const char *program_name)
+{
+    LOG_INFO("Usage: {} [mode] [iterations]", program_name);
+    LOG_INFO("  mode 1 | raw   : model inference only");
+    LOG_INFO("  mode 2 | prep  : cpu upload + preprocessing + inference");
+    LOG_INFO("  mode 3 | full  : cpu upload + preprocessing + inference + GPU NMS + warpAffine");
+    LOG_INFO("  iterations defaults to 5000");
+}
+
+DetectionBenchmarkMode parseBenchmarkMode(std::string_view mode_arg)
+{
+    if (mode_arg == "1" || mode_arg == "raw" || mode_arg == "inference" || mode_arg == "inference_only")
+    {
+        return DetectionBenchmarkMode::kInferenceOnly;
+    }
+    if (mode_arg == "2" || mode_arg == "prep" || mode_arg == "preprocess" || mode_arg == "upload_preprocess")
+    {
+        return DetectionBenchmarkMode::kUploadPreprocessInference;
+    }
+    if (mode_arg == "3" || mode_arg == "full" || mode_arg == "nms" || mode_arg == "full_pipeline")
+    {
+        return DetectionBenchmarkMode::kUploadPreprocessInferenceNms;
+    }
+
+    throw std::invalid_argument("Unknown benchmark mode");
+}
+
+} // namespace
 
 void deserializeDetectionEngine(const std::string &model_path_, nvinfer1::IRuntime *&runtime_detection_, nvinfer1::ICudaEngine *&engine_detection_)
 {
@@ -85,7 +118,7 @@ void deserializeDetectionEngine(const std::string &model_path_, nvinfer1::IRunti
     LOG_INFO("TensorRT Engine deserialized successfully, engine size: {} mb", engine_size / (1024.0 * 1024.0));
 }
 
-int main()
+int main(int argc, char **argv)
 {
     LOG_INFO("Starting face recognition with CUDA NMS");
 
@@ -129,45 +162,45 @@ int main()
 
     
 
-    auto thread_inference = std::thread([&]()
-                                        {
-                                            DetectionModelInferenceHelper inferenceHelper(
-                                                iCudaEngineDetection,
-                                                batch_sizes,
-                                                height,
-                                                width,
-                                                strides,
-                                                top_k,
-                                                confidence_threshold,
-                                                iou_threshold,
-                                                camera_height,
-                                                camera_width,
-                                                num_slices_x,
-                                                num_slices_y,
-                                                gap_x,
-                                                gap_y);
+    DetectionModelInferenceHelper inferenceHelper(
+        iCudaEngineDetection,
+        batch_sizes,
+        height,
+        width,
+        strides,
+        top_k,
+        confidence_threshold,
+        iou_threshold,
+        camera_height,
+        camera_width,
+        num_slices_x,
+        num_slices_y,
+        gap_x,
+        gap_y);
 
-                                            std::string image_path = data_config["detection"]["test_image_path"];
-                                            cv::Mat img = cv::imread(image_path);
-                                            cv::resize(img, img, cv::Size(camera_width, camera_height));
-                                            if (img.empty()) {
-                                                LOG_ERROR("Failed to load image: {}", image_path);
-                                                return;
-                                            }
-                                            auto start_time = std::chrono::high_resolution_clock::now();
-                                            const int batch = num_slices_x * num_slices_y;
-                                            for(int i = 0; i < 1; ++i) {
-                                                inferenceHelper.infer(img.data, batch);
-                                            }
-                                            auto end_time = std::chrono::high_resolution_clock::now();
-                                            std::chrono::duration<double> elapsed = end_time - start_time;
-                                            LOG_INFO("Inference completed in {:.2f} seconds for 5000 iterations (average {:.2f} ms per inference)", elapsed.count(), (elapsed.count() * 1000) / 5000);
-                                            
+    std::string image_path = data_config["detection"]["test_image_path"];
+    cv::Mat img = cv::imread(image_path);
+    if (img.empty()) {
+        LOG_ERROR("Failed to load image: {}", image_path);
+        return -1;
+    }
+    cv::resize(img, img, cv::Size(camera_width, camera_height));
 
-                                        });
+    const int batch = num_slices_x * num_slices_y;
 
-    if (thread_inference.joinable())
-        thread_inference.join();
+    if (argc >= 2) {
+        try {
+            const DetectionBenchmarkMode mode = parseBenchmarkMode(argv[1]);
+            const int iterations = (argc >= 3) ? std::stoi(argv[2]) : 5000;
+            inferenceHelper.benchmark(img.data, batch, iterations, mode);
+        } catch (const std::exception &e) {
+            LOG_ERROR("{}", e.what());
+            printUsage(argv[0]);
+            return -1;
+        }
+    } else {
+        inferenceHelper.infer(img.data, batch);
+    }
 
     LOG_INFO("Done");
 }

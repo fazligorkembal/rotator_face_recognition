@@ -25,6 +25,6 @@
     "identification": {
         "model_path": "/home/user/Documents/tensorrt_scrfd/models/r50.engine",
         "input_size": 112,
-        "feature_dim": 512
+        "input_min_size": 70
     }
 }
