@@ -47,8 +47,14 @@ add_executable(modeldetection_model_converter src/converters/detection_model_con
 target_link_libraries(modeldetection_model_converter PRIVATE ${COMMON_LIBS})
 
 
-option(LOGRESULTS "Show preprocessed slices via OpenCV imshow" OFF)
+option(LOGRESULTS "Write detection debug outputs under build/logresults" OFF)
 if(LOGRESULTS)
     target_compile_definitions(main PRIVATE LOGRESULTS)
     message("${ESC}[1;33m[DEBUG] LOGRESULTS enabled${ESC}[0m")
+endif()
+
+option(DISPLAYRESULTS "Display min-box-length filter results on the input image" OFF)
+if(DISPLAYRESULTS)
+    target_compile_definitions(main PRIVATE DISPLAYRESULTS)
+    message("${ESC}[1;33m[DEBUG] DISPLAYRESULTS enabled${ESC}[0m")
 endif()

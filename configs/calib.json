@@ -1,7 +1,6 @@
 {
     "general": {
         "device": 0,
-        "top_k": 512,
         "log_level": "debug"
     },
     "camera": {
@@ -12,9 +11,11 @@
     "detection": {
         "model_path": "/home/user/Documents/rfr/models/det_10g_dynamic.engine",
         "test_image_path": "/home/user/Documents/rfr/datasets/rfr/test1.png",
+        "test_video_path": "/home/user/Documents/rfr/datasets/rfr/videos/video1.webm",
         "input_size": 640,
-        "conf_threshold": 0.5,
-        "nms_threshold": 0.4,
+        "detection_top_k": 128,
+        "detection_conf_threshold": 0.5,
+        "detection_nms_threshold": 0.4,
         "batch_sizes": [1, 6, 6],
         "strides": [8, 16, 32],
         "num_slices_x": 3,
@@ -25,6 +26,7 @@
     "identification": {
         "model_path": "/home/user/Documents/tensorrt_scrfd/models/r50.engine",
         "input_size": 112,
-        "input_min_size": 70
+        "identifier_threshold_min_box_length": 20,
+        "batch_sizes": [4, 8, 16]
     }
 }

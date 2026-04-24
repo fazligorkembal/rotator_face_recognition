@@ -7,6 +7,10 @@
 #include <stdexcept>
 #include <string_view>
 
+#ifdef LOGRESULTS
+#include <filesystem>
+#endif
+
 #include <opencv2/opencv.hpp>
 #include "tensorrt/logging.h"
 #include <json.hpp>
@@ -15,9 +19,6 @@
 #include "detection_model_inference_helper.h"
 #include "utils.hpp"
 // #include "identification_model_inference_helper.h"
-
-
-
 
 // #include "bounded_queue.hpp"
 // #include "inference_objects.hpp"
@@ -34,37 +35,6 @@ Logger gLogger(Severity::kINFO);
 
 using namespace nvinfer1;
 using namespace cv;
-
-namespace {
-
-void printUsage(const char *program_name)
-{
-    LOG_INFO("Usage: {} [mode] [iterations]", program_name);
-    LOG_INFO("  mode 1 | raw   : model inference only");
-    LOG_INFO("  mode 2 | prep  : cpu upload + preprocessing + inference");
-    LOG_INFO("  mode 3 | full  : cpu upload + preprocessing + inference + GPU NMS + warpAffine");
-    LOG_INFO("  iterations defaults to 5000");
-}
-
-DetectionBenchmarkMode parseBenchmarkMode(std::string_view mode_arg)
-{
-    if (mode_arg == "1" || mode_arg == "raw" || mode_arg == "inference" || mode_arg == "inference_only")
-    {
-        return DetectionBenchmarkMode::kInferenceOnly;
-    }
-    if (mode_arg == "2" || mode_arg == "prep" || mode_arg == "preprocess" || mode_arg == "upload_preprocess")
-    {
-        return DetectionBenchmarkMode::kUploadPreprocessInference;
-    }
-    if (mode_arg == "3" || mode_arg == "full" || mode_arg == "nms" || mode_arg == "full_pipeline")
-    {
-        return DetectionBenchmarkMode::kUploadPreprocessInferenceNms;
-    }
-
-    throw std::invalid_argument("Unknown benchmark mode");
-}
-
-} // namespace
 
 void deserializeDetectionEngine(const std::string &model_path_, nvinfer1::IRuntime *&runtime_detection_, nvinfer1::ICudaEngine *&engine_detection_)
 {
@@ -140,27 +110,22 @@ int main(int argc, char **argv)
     nvinfer1::IRuntime *iRuntimeDetection = nullptr;
     nvinfer1::ICudaEngine *iCudaEngineDetection = nullptr;
 
-    // nvinfer1::IRuntime *iRuntimeIdentifier = nullptr;
-    // nvinfer1::ICudaEngine *iCudaEngineIdentifier = nullptr;
-
     deserializeDetectionEngine(data_config["detection"]["model_path"], iRuntimeDetection, iCudaEngineDetection);
-    //
 
     std::vector<int> batch_sizes = data_config["detection"]["batch_sizes"].get<std::vector<int>>();
     std::vector<int> strides = data_config["detection"]["strides"].get<std::vector<int>>();
-    int32_t top_k = data_config["general"]["top_k"];
+    int32_t top_k = data_config["detection"]["detection_top_k"];
     int32_t height = data_config["detection"]["input_size"];
     int32_t width = data_config["detection"]["input_size"];
-    float confidence_threshold = data_config["detection"]["conf_threshold"];
-    float iou_threshold = data_config["detection"]["nms_threshold"];
-    int32_t camera_height  = data_config["camera"]["height"];
-    int32_t camera_width   = data_config["camera"]["width"];
-    int32_t num_slices_x   = data_config["detection"]["num_slices_x"];
-    int32_t num_slices_y   = data_config["detection"]["num_slices_y"];
-    int32_t gap_x          = data_config["detection"]["gap_x"];
-    int32_t gap_y          = data_config["detection"]["gap_y"];
-
-    
+    float confidence_threshold = data_config["detection"]["detection_conf_threshold"];
+    float iou_threshold = data_config["detection"]["detection_nms_threshold"];
+    int32_t min_box_length = data_config["identification"]["identifier_threshold_min_box_length"];
+    int32_t camera_height = data_config["camera"]["height"];
+    int32_t camera_width = data_config["camera"]["width"];
+    int32_t num_slices_x = data_config["detection"]["num_slices_x"];
+    int32_t num_slices_y = data_config["detection"]["num_slices_y"];
+    int32_t gap_x = data_config["detection"]["gap_x"];
+    int32_t gap_y = data_config["detection"]["gap_y"];
 
     DetectionModelInferenceHelper inferenceHelper(
         iCudaEngineDetection,
@@ -176,8 +141,32 @@ int main(int argc, char **argv)
         num_slices_x,
         num_slices_y,
         gap_x,
-        gap_y);
+        gap_y,
+        min_box_length);
+    
+    //read opencv video
+    std::string video_path = data_config["detection"]["test_video_path"];
+    cv::VideoCapture cap(video_path);
+    if (!cap.isOpened()) {
+        LOG_ERROR("Failed to open video: {}", video_path);
+        return -1;
+    }
 
+    cv::Mat frame;
+    while (cap.read(frame)) {
+        if (frame.empty()) {
+            LOG_ERROR("Failed to read frame from video");
+            break;
+        }
+        cv::resize(frame, frame, cv::Size(camera_width, camera_height));
+        auto start_time = std::chrono::high_resolution_clock::now();
+        inferenceHelper.infer(frame.data, DetectionType::SEARCH);
+        auto end_time = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> elapsed = end_time - start_time;
+        LOG_INFO("Inference time for current frame: {:.2f} ms", elapsed.count() * 1000);
+    }
+
+    /*
     std::string image_path = data_config["detection"]["test_image_path"];
     cv::Mat img = cv::imread(image_path);
     if (img.empty()) {
@@ -185,22 +174,43 @@ int main(int argc, char **argv)
         return -1;
     }
     cv::resize(img, img, cv::Size(camera_width, camera_height));
+    inferenceHelper.infer(img.data, DetectionType::SEARCH);
+    */
 
-    const int batch = num_slices_x * num_slices_y;
-
-    if (argc >= 2) {
-        try {
-            const DetectionBenchmarkMode mode = parseBenchmarkMode(argv[1]);
-            const int iterations = (argc >= 3) ? std::stoi(argv[2]) : 5000;
-            inferenceHelper.benchmark(img.data, batch, iterations, mode);
-        } catch (const std::exception &e) {
-            LOG_ERROR("{}", e.what());
-            printUsage(argv[0]);
-            return -1;
-        }
-    } else {
-        inferenceHelper.infer(img.data, batch);
+    /*
+    const cv::Rect track_crop_rect(1152, 440, width, height);
+    if (track_crop_rect.x < 0 ||
+        track_crop_rect.y < 0 ||
+        track_crop_rect.x + track_crop_rect.width > img.cols ||
+        track_crop_rect.y + track_crop_rect.height > img.rows)
+    {
+        LOG_ERROR("Track crop rect is outside image bounds");
+        return -1;
     }
 
+    cv::Mat track_crop = img(track_crop_rect).clone();
+
+    auto build_dir = std::filesystem::current_path();
+    if (build_dir.filename() != "build")
+    {
+        build_dir /= "build";
+    }
+    const auto log_dir = build_dir / "logresults";
+    std::filesystem::create_directories(log_dir);
+    cv::imwrite((log_dir / "track_input_crop.jpg").string(), track_crop);
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+    for(int i = 0; i < 5000; ++i)
+    inferenceHelper.infer(track_crop.data,
+                          DetectionType::TRACK,
+                          img.data,
+                          img.cols,
+                          img.rows,
+                          track_crop_rect.x,
+                          track_crop_rect.y);
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end_time - start_time;
+    LOG_INFO("Average inference time per frame: {:.2f} ms", (elapsed.count() * 1000) / 5000);
+    */
     LOG_INFO("Done");
 }

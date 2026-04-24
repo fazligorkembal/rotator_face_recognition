@@ -110,7 +110,7 @@ def main():
     img = cv2.resize(img, (cam_w, cam_h))
     batch = preprocess(img, slices, model_sz, model_sz)
 
-    build_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build")
+    build_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build/logresults")
     os.makedirs(build_dir, exist_ok=True)
 
     save_raw_output(os.path.join(build_dir, "onnx_input_all_batches.txt"), batch)
