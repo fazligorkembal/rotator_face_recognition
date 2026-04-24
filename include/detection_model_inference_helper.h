@@ -21,6 +21,13 @@ struct Slice {
     int x1, y1, x2, y2;
 };
 
+struct DetectionBox {
+    int x1 = 0;
+    int y1 = 0;
+    int x2 = 0;
+    int y2 = 0;
+    float score = 0.0f;
+};
 
 static constexpr int kNumRawOutputs = 9;
 
@@ -57,6 +64,7 @@ public:
                int log_visual_height = 0,
                int log_offset_x = 0,
                int log_offset_y = 0);
+    std::vector<DetectionBox> getLastDetections(DetectionType detection_type) const;
 
 private:
     static constexpr int kNumDetectionGraphs = 2;

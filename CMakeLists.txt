@@ -27,10 +27,6 @@ add_executable(main
     src/detection_model_inference_helper.cu
 )
 
-add_executable(detection_model_converter
-    src/converters/detection_model_converter.cpp
-)
-
 set(COMMON_LIBS
     spdlog::spdlog
     nvinfer
@@ -41,10 +37,12 @@ set(COMMON_LIBS
 )
 
 target_link_libraries(main PRIVATE ${COMMON_LIBS})
-target_link_libraries(detection_model_converter PRIVATE ${COMMON_LIBS})
 
 add_executable(modeldetection_model_converter src/converters/detection_model_converter.cpp)
 target_link_libraries(modeldetection_model_converter PRIVATE ${COMMON_LIBS})
+
+add_executable(modelidentification_model_converter src/converters/identification_model_converter.cpp)
+target_link_libraries(modelidentification_model_converter PRIVATE ${COMMON_LIBS})
 
 
 option(LOGRESULTS "Write detection debug outputs under build/logresults" OFF)

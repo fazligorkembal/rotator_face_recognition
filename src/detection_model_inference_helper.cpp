@@ -1,10 +1,10 @@
 #include "spd_logger_helper.h"
 #include "detection_model_inference_helper.h"
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
 #if defined(LOGRESULTS) || defined(DISPLAYRESULTS)
-#include <algorithm>
 #include <opencv2/opencv.hpp>
 #endif
 
@@ -280,6 +280,7 @@ void DetectionModelInferenceHelper::infer(const uint8_t *host_image,
         cv::namedWindow(window_name, cv::WINDOW_NORMAL);
         cv::imshow(window_name, visual);
         cv::waitKey(1);
+        LOG_INFO("Displayed frame resolution: {}x{}", visual_width, visual_height);
     }
 #endif
 
@@ -525,6 +526,62 @@ void DetectionModelInferenceHelper::infer(const uint8_t *host_image,
 
     cv::imwrite((log_dir / (prefix + "_final_visual.jpg")).string(), visual);
 #endif
+}
+
+std::vector<DetectionBox> DetectionModelInferenceHelper::getLastDetections(DetectionType detection_type) const
+{
+    const int batch = batchSizeForDetectionType(detection_type);
+    const size_t capacity =
+        static_cast<size_t>(batch) * static_cast<size_t>(detection_top_k_);
+
+    std::vector<int32_t> host_counts(static_cast<size_t>(batch));
+    std::vector<float> host_scores(capacity);
+    std::vector<float4> host_bboxes(capacity);
+
+    checkCuda(cudaMemcpy(host_counts.data(),
+                         device_final_num_detections_,
+                         host_counts.size() * sizeof(int32_t),
+                         cudaMemcpyDeviceToHost),
+              "Failed to copy detection final counts to host");
+    checkCuda(cudaMemcpy(host_scores.data(),
+                         device_final_scores_,
+                         host_scores.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost),
+              "Failed to copy detection final scores to host");
+    checkCuda(cudaMemcpy(host_bboxes.data(),
+                         device_final_bboxes_,
+                         host_bboxes.size() * sizeof(float4),
+                         cudaMemcpyDeviceToHost),
+              "Failed to copy detection final bboxes to host");
+
+    std::vector<DetectionBox> detections;
+    detections.reserve(capacity);
+
+    for (int batch_index = 0; batch_index < batch; ++batch_index)
+    {
+        const int offset_x =
+            detection_type == DetectionType::SEARCH ? slices_[static_cast<size_t>(batch_index)].x1 : 0;
+        const int offset_y =
+            detection_type == DetectionType::SEARCH ? slices_[static_cast<size_t>(batch_index)].y1 : 0;
+        const int count = std::min(host_counts[static_cast<size_t>(batch_index)], detection_top_k_);
+
+        for (int rank = 0; rank < count; ++rank)
+        {
+            const size_t flat_index =
+                static_cast<size_t>(batch_index) * static_cast<size_t>(detection_top_k_) +
+                static_cast<size_t>(rank);
+            const auto &bbox = host_bboxes[flat_index];
+            DetectionBox detection;
+            detection.x1 = static_cast<int>(bbox.x) + offset_x;
+            detection.y1 = static_cast<int>(bbox.y) + offset_y;
+            detection.x2 = static_cast<int>(bbox.z) + offset_x;
+            detection.y2 = static_cast<int>(bbox.w) + offset_y;
+            detection.score = host_scores[flat_index];
+            detections.push_back(detection);
+        }
+    }
+
+    return detections;
 }
 
 void DetectionModelInferenceHelper::bindTensorAddresses(IExecutionContext *context, const char *context_name)

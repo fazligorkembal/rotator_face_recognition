@@ -4,14 +4,15 @@
         "log_level": "debug"
     },
     "camera": {
-        "path": "videos/test.mp4",
+        "test_video_path": "/home/user/Documents/rfr/datasets/rfr/videos/video1.webm",
         "width": 1920,
-        "height": 1080
+        "height": 1080, 
+        "time_interval_face_record": 1.0
     },
     "detection": {
         "model_path": "/home/user/Documents/rfr/models/det_10g_dynamic.engine",
         "test_image_path": "/home/user/Documents/rfr/datasets/rfr/test1.png",
-        "test_video_path": "/home/user/Documents/rfr/datasets/rfr/videos/video1.webm",
+        
         "input_size": 640,
         "detection_top_k": 128,
         "detection_conf_threshold": 0.5,
@@ -24,9 +25,9 @@
         "gap_y": 200
     },
     "identification": {
-        "model_path": "/home/user/Documents/tensorrt_scrfd/models/r50.engine",
+        "model_path": "/home/user/Documents/rfr/models/r50.engine",
         "input_size": 112,
-        "identifier_threshold_min_box_length": 20,
-        "batch_sizes": [4, 8, 16]
+        "identifier_threshold_min_box_length": 40,
+        "batch_sizes": [1, 1, 8]
     }
 }

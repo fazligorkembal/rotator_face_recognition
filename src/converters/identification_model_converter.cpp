@@ -153,14 +153,6 @@ bool convertToEngine(const std::string &onnxFile, const std::string &enginePath)
     if (input0Batch == -1)
     {
         spdlog::info("Model supports dynamic batch size");
-        // set fixed 1 batch size for identification model
-        for (int32_t i = 0; i < numInputs; ++i)
-        {
-            auto inputTensor = network->getInput(i);
-            auto dims = inputTensor->getDimensions();
-            dims.d[0] = 1;
-            inputTensor->setDimensions(dims);
-        }
     }
     else
     {
@@ -173,25 +165,9 @@ bool convertToEngine(const std::string &onnxFile, const std::string &enginePath)
         return false;
     }
 
-    // For models with dynamic batch size, configure optimization profile
-    bool needsOptimizationProfile = false;
-    for (int32_t i = 0; i < numInputs; ++i)
+    if (input0Batch == -1)
     {
-        auto inputTensor = network->getInput(i);
-        auto dims = inputTensor->getDimensions();
-        for (int j = 0; j < dims.nbDims; ++j)
-        {
-            if (dims.d[j] == -1)
-            {
-                needsOptimizationProfile = true;
-                break;
-            }
-        }
-    }
-
-    if (needsOptimizationProfile)
-    {
-        spdlog::info("Configuring optimization profile for dynamic shapes");
+        spdlog::info("Configuring optimization profile: min=1, opt=1, max=8");
         nvinfer1::IOptimizationProfile *profile = builder->createOptimizationProfile();
         if (!profile)
         {
@@ -204,10 +180,16 @@ bool convertToEngine(const std::string &onnxFile, const std::string &enginePath)
             auto dims = inputTensor->getDimensions();
             std::string inputName = inputTensor->getName();
 
-            // Set min, opt, and max dimensions (all same since we fixed batch to 1)
-            profile->setDimensions(inputName.c_str(), OptProfileSelector::kMIN, dims);
-            profile->setDimensions(inputName.c_str(), OptProfileSelector::kOPT, dims);
-            profile->setDimensions(inputName.c_str(), OptProfileSelector::kMAX, dims);
+            nvinfer1::Dims minDims = dims;
+            nvinfer1::Dims optDims = dims;
+            nvinfer1::Dims maxDims = dims;
+            minDims.d[0] = 1;
+            optDims.d[0] = 1;
+            maxDims.d[0] = 8;
+
+            profile->setDimensions(inputName.c_str(), OptProfileSelector::kMIN, minDims);
+            profile->setDimensions(inputName.c_str(), OptProfileSelector::kOPT, optDims);
+            profile->setDimensions(inputName.c_str(), OptProfileSelector::kMAX, maxDims);
         }
 
         config->addOptimizationProfile(profile);
@@ -259,8 +241,8 @@ bool convertToEngine(const std::string &onnxFile, const std::string &enginePath)
 int main()
 {
     spdlog::info("Starting model conversion...");
-    std::string onnxFile = "/home/user/Documents/tensorrt_scrfd/models/r50.onnx";
-    std::string engineFile = "/home/user/Documents/tensorrt_scrfd/models/r50.engine";
+    std::string onnxFile = "/home/user/Documents/rfr/models/r50.onnx";
+    std::string engineFile = "/home/user/Documents/rfr/models/r50.engine";
     if (convertToEngine(onnxFile, engineFile))
     {
         spdlog::info("Model conversion completed successfully.");
