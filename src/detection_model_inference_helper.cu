@@ -413,6 +413,199 @@ __global__ void gatherFinalResultKernel(
     }
 }
 
+__global__ void estimateSimilarityKernel(
+    const float2 *device_final_landmarks,
+    const int32_t *device_final_count,
+    float *device_similarity_transforms,
+    int batch_size,
+    bool is_search)
+{
+    const int rank = blockIdx.x * blockDim.x + threadIdx.x;
+    const int batch = blockIdx.y;
+
+    if (batch >= batch_size)
+    {
+        return;
+    }
+
+    const int count = min(device_final_count[batch], d_top_k);
+    if (rank >= count)
+    {
+        return;
+    }
+
+    const int face_index = batch * d_top_k + rank;
+    const int landmark_offset = face_index * DetectionModelInferenceHelper::kLandmarkCount;
+    const int offset_x = is_search ? d_slices_coordinates[batch * 4 + 0] : 0;
+    const int offset_y = is_search ? d_slices_coordinates[batch * 4 + 1] : 0;
+
+    float2 src_centroid = make_float2(0.0f, 0.0f);
+    float2 src_points[DetectionModelInferenceHelper::kLandmarkCount];
+    for (int i = 0; i < DetectionModelInferenceHelper::kLandmarkCount; ++i)
+    {
+        const float2 point = device_final_landmarks[landmark_offset + i];
+        src_points[i] = make_float2(point.x + static_cast<float>(offset_x),
+                                    point.y + static_cast<float>(offset_y));
+        src_centroid.x += src_points[i].x;
+        src_centroid.y += src_points[i].y;
+    }
+    src_centroid.x *= 1.0f / static_cast<float>(DetectionModelInferenceHelper::kLandmarkCount);
+    src_centroid.y *= 1.0f / static_cast<float>(DetectionModelInferenceHelper::kLandmarkCount);
+
+    float numerator_a = 0.0f;
+    float numerator_b = 0.0f;
+    float denominator = 0.0f;
+    for (int i = 0; i < DetectionModelInferenceHelper::kLandmarkCount; ++i)
+    {
+        const float sx = src_points[i].x - src_centroid.x;
+        const float sy = src_points[i].y - src_centroid.y;
+        const float dx = d_arcface_normalized_destination[i].x;
+        const float dy = d_arcface_normalized_destination[i].y;
+
+        numerator_a += sx * dx + sy * dy;
+        numerator_b += sy * dx - sx * dy;
+        denominator += dx * dx + dy * dy;
+    }
+
+    const float inv_denominator = denominator > 1e-6f ? 1.0f / denominator : 0.0f;
+    const float a = numerator_a * inv_denominator;
+    const float b = numerator_b * inv_denominator;
+    const float tx =
+        src_centroid.x - (a * d_arcface_centroid_destination.x - b * d_arcface_centroid_destination.y);
+    const float ty =
+        src_centroid.y - (b * d_arcface_centroid_destination.x + a * d_arcface_centroid_destination.y);
+
+    const int transform_offset = face_index * 6;
+    device_similarity_transforms[transform_offset + 0] = a;
+    device_similarity_transforms[transform_offset + 1] = -b;
+    device_similarity_transforms[transform_offset + 2] = tx;
+    device_similarity_transforms[transform_offset + 3] = b;
+    device_similarity_transforms[transform_offset + 4] = a;
+    device_similarity_transforms[transform_offset + 5] = ty;
+}
+
+__global__ void warpAffineKernel(
+    const uint8_t *source_image,
+    int source_width,
+    int source_height,
+    const int32_t *device_final_count,
+    const float *device_similarity_transforms,
+    float *device_warped_faces,
+    int batch_size)
+{
+    const int out_x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int out_y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int face_index = blockIdx.z;
+
+    if (out_x >= DetectionModelInferenceHelper::kWarpedFaceSize ||
+        out_y >= DetectionModelInferenceHelper::kWarpedFaceSize)
+    {
+        return;
+    }
+
+    const int batch = face_index / d_top_k;
+    const int rank = face_index % d_top_k;
+    if (batch >= batch_size)
+    {
+        return;
+    }
+
+    const int count = min(device_final_count[batch], d_top_k);
+    if (rank >= count)
+    {
+        return;
+    }
+
+    const int transform_offset = face_index * 6;
+    const float m0 = device_similarity_transforms[transform_offset + 0];
+    const float m1 = device_similarity_transforms[transform_offset + 1];
+    const float m2 = device_similarity_transforms[transform_offset + 2];
+    const float m3 = device_similarity_transforms[transform_offset + 3];
+    const float m4 = device_similarity_transforms[transform_offset + 4];
+    const float m5 = device_similarity_transforms[transform_offset + 5];
+
+    const float src_x = m0 * static_cast<float>(out_x) + m1 * static_cast<float>(out_y) + m2;
+    const float src_y = m3 * static_cast<float>(out_x) + m4 * static_cast<float>(out_y) + m5;
+    const int out_idx =
+        (face_index * DetectionModelInferenceHelper::kWarpedFaceSize *
+             DetectionModelInferenceHelper::kWarpedFaceSize +
+         out_y * DetectionModelInferenceHelper::kWarpedFaceSize + out_x) *
+        DetectionModelInferenceHelper::kWarpedFaceChannels;
+
+    if (src_x < 0.0f || src_y < 0.0f ||
+        src_x > static_cast<float>(source_width - 1) ||
+        src_y > static_cast<float>(source_height - 1))
+    {
+        device_warped_faces[out_idx + 0] = 0.0f;
+        device_warped_faces[out_idx + 1] = 0.0f;
+        device_warped_faces[out_idx + 2] = 0.0f;
+        return;
+    }
+
+    const int x0 = min(max(static_cast<int>(floorf(src_x)), 0), source_width - 1);
+    const int y0 = min(max(static_cast<int>(floorf(src_y)), 0), source_height - 1);
+    const int x1 = min(x0 + 1, source_width - 1);
+    const int y1 = min(y0 + 1, source_height - 1);
+    const float wx = src_x - static_cast<float>(x0);
+    const float wy = src_y - static_cast<float>(y0);
+
+    for (int channel = 0; channel < DetectionModelInferenceHelper::kWarpedFaceChannels; ++channel)
+    {
+        const float p00 = static_cast<float>(source_image[(y0 * source_width + x0) * 3 + channel]);
+        const float p01 = static_cast<float>(source_image[(y0 * source_width + x1) * 3 + channel]);
+        const float p10 = static_cast<float>(source_image[(y1 * source_width + x0) * 3 + channel]);
+        const float p11 = static_cast<float>(source_image[(y1 * source_width + x1) * 3 + channel]);
+
+        const float top = p00 * (1.0f - wx) + p01 * wx;
+        const float bottom = p10 * (1.0f - wx) + p11 * wx;
+        device_warped_faces[out_idx + channel] = top * (1.0f - wy) + bottom * wy;
+    }
+}
+
+__global__ void preprocessWarpedFacesForIdentificationKernel(
+    const float *device_warped_faces,
+    const int32_t *device_final_count,
+    float *device_warped_faces_identification,
+    int batch_size)
+{
+    const int out_x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int out_y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int face_index = blockIdx.z;
+
+    if (out_x >= DetectionModelInferenceHelper::kWarpedFaceSize ||
+        out_y >= DetectionModelInferenceHelper::kWarpedFaceSize)
+    {
+        return;
+    }
+
+    const int batch = face_index / d_top_k;
+    const int rank = face_index % d_top_k;
+    if (batch >= batch_size)
+    {
+        return;
+    }
+
+    const int count = min(device_final_count[batch], d_top_k);
+    if (rank >= count)
+    {
+        return;
+    }
+
+    const int plane =
+        DetectionModelInferenceHelper::kWarpedFaceSize * DetectionModelInferenceHelper::kWarpedFaceSize;
+    const int pixel = out_y * DetectionModelInferenceHelper::kWarpedFaceSize + out_x;
+    const int src_offset =
+        (face_index * plane + pixel) * DetectionModelInferenceHelper::kWarpedFaceChannels;
+    const int dst_offset = face_index * DetectionModelInferenceHelper::kWarpedFaceChannels * plane + pixel;
+
+    device_warped_faces_identification[dst_offset + 0 * plane] =
+        (device_warped_faces[src_offset + 2] - 127.5f) / 128.0f;
+    device_warped_faces_identification[dst_offset + 1 * plane] =
+        (device_warped_faces[src_offset + 1] - 127.5f) / 128.0f;
+    device_warped_faces_identification[dst_offset + 2 * plane] =
+        (device_warped_faces[src_offset + 0] - 127.5f) / 128.0f;
+}
+
 // SEARCH: src is the full camera frame in BGR HWC. Each graph batch item reads
 // one fixed slice coordinate from constant memory and writes RGB CHW float input.
 __global__ void preprocessSearchBGRToFloatCHW(const uint8_t *src, float *dst, int batch)
@@ -595,6 +788,67 @@ void DetectionModelInferenceHelper::launchGatherFinalResultKernel(int batch, cud
         device_final_landmarks_,
         device_final_num_detections_,
         device_num_selected_,
+        batch);
+}
+
+void DetectionModelInferenceHelper::launchEstimateSimilarityKernel(
+    int batch,
+    DetectionType detection_type,
+    cudaStream_t stream)
+{
+    const dim3 block(256, 1, 1);
+    const dim3 grid((detection_top_k_ + block.x - 1) / block.x, batch, 1);
+
+    estimateSimilarityKernel<<<grid, block, 0, stream>>>(
+        device_final_landmarks_,
+        device_final_num_detections_,
+        device_similarity_transforms_,
+        batch,
+        detection_type == DetectionType::SEARCH);
+}
+
+void DetectionModelInferenceHelper::launchWarpAffineKernel(
+    int batch,
+    DetectionType detection_type,
+    cudaStream_t stream)
+{
+    const uint8_t *source_image = deviceInputForDetectionType(detection_type);
+    const int source_width =
+        detection_type == DetectionType::SEARCH ? camera_input_width_ : model_input_width_;
+    const int source_height =
+        detection_type == DetectionType::SEARCH ? camera_input_height_ : model_input_height_;
+    const int total_faces = batch * detection_top_k_;
+    const dim3 block(16, 16, 1);
+    const dim3 grid(
+        (kWarpedFaceSize + block.x - 1) / block.x,
+        (kWarpedFaceSize + block.y - 1) / block.y,
+        total_faces);
+
+    warpAffineKernel<<<grid, block, 0, stream>>>(
+        source_image,
+        source_width,
+        source_height,
+        device_final_num_detections_,
+        device_similarity_transforms_,
+        device_warped_faces_,
+        batch);
+}
+
+void DetectionModelInferenceHelper::launchPreprocessWarpedFacesForIdentificationKernel(
+    int batch,
+    cudaStream_t stream)
+{
+    const int total_faces = batch * detection_top_k_;
+    const dim3 block(16, 16, 1);
+    const dim3 grid(
+        (kWarpedFaceSize + block.x - 1) / block.x,
+        (kWarpedFaceSize + block.y - 1) / block.y,
+        total_faces);
+
+    preprocessWarpedFacesForIdentificationKernel<<<grid, block, 0, stream>>>(
+        device_warped_faces_,
+        device_final_num_detections_,
+        device_warped_faces_identification_,
         batch);
 }
 

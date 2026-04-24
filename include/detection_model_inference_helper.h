@@ -29,6 +29,18 @@ struct DetectionBox {
     float score = 0.0f;
 };
 
+struct WarpedFaceBatch {
+    int count = 0;
+    std::vector<float> faces = {};
+};
+
+struct DeviceWarpedFaceBatch {
+    int count = 0;
+    int batch_count = 0;
+    const int32_t *batch_counts = nullptr;
+    const float *device_faces = nullptr;
+};
+
 static constexpr int kNumRawOutputs = 9;
 
 class DetectionModelInferenceHelper
@@ -37,6 +49,8 @@ public:
 
     static constexpr int kMaxSlices = 16; // This should be set according to the maximum expected number of slices (num_slices_x * num_slices_y)
     static constexpr int kLandmarkCount = 5; // Assuming 5 landmarks per detection, adjust if necessary
+    static constexpr int kWarpedFaceSize = 112;
+    static constexpr int kWarpedFaceChannels = 3;
 
     DetectionModelInferenceHelper(
         ICudaEngine *&engine,
@@ -65,6 +79,10 @@ public:
                int log_offset_x = 0,
                int log_offset_y = 0);
     std::vector<DetectionBox> getLastDetections(DetectionType detection_type) const;
+    WarpedFaceBatch getLastWarpedFaces(DetectionType detection_type);
+    DeviceWarpedFaceBatch getDeviceWarpedFacesForIdentification(DetectionType detection_type);
+    cudaStream_t stream() const { return stream_; }
+    uint8_t *hostInputBuffer(DetectionType detection_type) const;
 
 private:
     static constexpr int kNumDetectionGraphs = 2;
@@ -102,6 +120,9 @@ private:
     void launchGatherAllKernel(int batch, cudaStream_t stream);
     void launchBitmaskNMSKernel(int batch, cudaStream_t stream);
     void launchGatherFinalResultKernel(int batch, cudaStream_t stream);
+    void launchEstimateSimilarityKernel(int batch, DetectionType detection_type, cudaStream_t stream);
+    void launchWarpAffineKernel(int batch, DetectionType detection_type, cudaStream_t stream);
+    void launchPreprocessWarpedFacesForIdentificationKernel(int batch, cudaStream_t stream);
 
     // TOP Level model parameters
     std::string model_path_;
@@ -120,8 +141,8 @@ private:
 
     // Buffers for input and output data
     uint8_t *host_jetson_input_buffer_search_uint8_t_ = nullptr;   // full-frame mapped pinned memory for search mode
-    uint8_t *device_jetson_ptr_search_uint8_t_ = nullptr;          // GPU alias of the full-frame search input buffer
     uint8_t *host_jetson_input_buffer_track_uint8_t_ = nullptr;    // 640x640 mapped pinned memory for track mode
+    uint8_t *device_jetson_ptr_search_uint8_t_ = nullptr;          // GPU alias of the full-frame search input buffer
     uint8_t *device_jetson_ptr_track_uint8_t_ = nullptr;           // GPU alias of the track-mode input buffer
     float   *device_jetson_input_buffer_float_ = nullptr;   // preprocessing output, TensorRT reads from here
     int32_t anchor_stack_ = 2;
@@ -156,6 +177,10 @@ private:
     float4 *device_final_bboxes_ = nullptr;
     float2 *device_final_landmarks_ = nullptr;
     int32_t *device_final_num_detections_ = nullptr;
+    float *device_similarity_transforms_ = nullptr;
+    float *device_warped_faces_ = nullptr;
+    float *device_warped_faces_identification_ = nullptr;
+    std::array<int32_t, kMaxSlices> host_identification_counts_ = {};
     void *device_sort_storage_ = nullptr;
     size_t sort_storage_bytes_ = 0;
     cudaStream_t stream_ = nullptr;

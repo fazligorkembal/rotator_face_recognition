@@ -199,6 +199,13 @@ DetectionModelInferenceHelper::~DetectionModelInferenceHelper()
     freeBuffers();
 }
 
+uint8_t *DetectionModelInferenceHelper::hostInputBuffer(DetectionType detection_type) const
+{
+    return detection_type == DetectionType::SEARCH
+        ? host_jetson_input_buffer_search_uint8_t_
+        : host_jetson_input_buffer_track_uint8_t_;
+}
+
 void DetectionModelInferenceHelper::infer(const uint8_t *host_image,
                                           DetectionType detection_type,
                                           const uint8_t *log_visual_image,
@@ -209,7 +216,10 @@ void DetectionModelInferenceHelper::infer(const uint8_t *host_image,
 {
     stageUploadHostImage(host_image, detection_type);
     launchCapturedGraph(detection_type);
+
+#if defined(LOGRESULTS) || defined(DISPLAYRESULTS)
     checkCuda(cudaStreamSynchronize(stream_), "Failed to synchronize detection inference stream");
+#endif
 
 #if !defined(LOGRESULTS)
     (void)log_visual_image;
@@ -224,19 +234,33 @@ void DetectionModelInferenceHelper::infer(const uint8_t *host_image,
         const int batch = batchSizeForDetectionType(detection_type);
         const size_t sorted_count =
             static_cast<size_t>(batch) * static_cast<size_t>(detection_top_k_);
+        const size_t final_count =
+            static_cast<size_t>(batch) * static_cast<size_t>(detection_top_k_);
         std::vector<int32_t> host_num_selected(static_cast<size_t>(batch));
         std::vector<float4> host_sorted_bboxes(sorted_count);
+        std::vector<int32_t> host_final_num_detections(static_cast<size_t>(batch));
+        std::vector<float4> host_final_bboxes(final_count);
 
         checkCuda(cudaMemcpy(host_num_selected.data(),
                              device_num_selected_,
                              host_num_selected.size() * sizeof(int32_t),
                              cudaMemcpyDeviceToHost),
-                  "Failed to copy detection num selected to host for DISPLAYRESULTS");
+                  "Failed to copy detection selected counts to host for DISPLAYRESULTS");
         checkCuda(cudaMemcpy(host_sorted_bboxes.data(),
                              device_sorted_bboxes_,
                              host_sorted_bboxes.size() * sizeof(float4),
                              cudaMemcpyDeviceToHost),
                   "Failed to copy detection sorted bboxes to host for DISPLAYRESULTS");
+        checkCuda(cudaMemcpy(host_final_num_detections.data(),
+                             device_final_num_detections_,
+                             host_final_num_detections.size() * sizeof(int32_t),
+                             cudaMemcpyDeviceToHost),
+                  "Failed to copy detection final counts to host for DISPLAYRESULTS");
+        checkCuda(cudaMemcpy(host_final_bboxes.data(),
+                             device_final_bboxes_,
+                             host_final_bboxes.size() * sizeof(float4),
+                             cudaMemcpyDeviceToHost),
+                  "Failed to copy detection final bboxes to host for DISPLAYRESULTS");
 
         const int visual_width =
             detection_type == DetectionType::SEARCH ? camera_input_width_ : model_input_width_;
@@ -251,9 +275,12 @@ void DetectionModelInferenceHelper::infer(const uint8_t *host_image,
                 detection_type == DetectionType::SEARCH ? slices_[static_cast<size_t>(batch_index)].x1 : 0;
             const int offset_y =
                 detection_type == DetectionType::SEARCH ? slices_[static_cast<size_t>(batch_index)].y1 : 0;
-            const int count = std::min(host_num_selected[static_cast<size_t>(batch_index)], detection_top_k_);
+            const int selected_count =
+                std::min(host_num_selected[static_cast<size_t>(batch_index)], detection_top_k_);
+            const int count =
+                std::min(host_final_num_detections[static_cast<size_t>(batch_index)], detection_top_k_);
 
-            for (int rank = 0; rank < count; ++rank)
+            for (int rank = 0; rank < selected_count; ++rank)
             {
                 const size_t flat_index =
                     static_cast<size_t>(batch_index) * static_cast<size_t>(detection_top_k_) +
@@ -261,11 +288,26 @@ void DetectionModelInferenceHelper::infer(const uint8_t *host_image,
                 const auto &bbox = host_sorted_bboxes[flat_index];
                 const float box_width = std::max(0.0f, bbox.z - bbox.x);
                 const float box_height = std::max(0.0f, bbox.w - bbox.y);
-                const cv::Scalar color =
-                    (box_width >= static_cast<float>(min_box_length_) &&
-                     box_height >= static_cast<float>(min_box_length_))
-                        ? cv::Scalar(0, 255, 0)
-                        : cv::Scalar(0, 0, 255);
+                if (box_width >= static_cast<float>(min_box_length_) &&
+                    box_height >= static_cast<float>(min_box_length_))
+                {
+                    continue;
+                }
+
+                const int x1 = std::clamp(static_cast<int>(bbox.x) + offset_x, 0, visual_width - 1);
+                const int y1 = std::clamp(static_cast<int>(bbox.y) + offset_y, 0, visual_height - 1);
+                const int x2 = std::clamp(static_cast<int>(bbox.z) + offset_x, 0, visual_width - 1);
+                const int y2 = std::clamp(static_cast<int>(bbox.w) + offset_y, 0, visual_height - 1);
+                cv::rectangle(visual, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 0, 255), 2);
+            }
+
+            for (int rank = 0; rank < count; ++rank)
+            {
+                const size_t flat_index =
+                    static_cast<size_t>(batch_index) * static_cast<size_t>(detection_top_k_) +
+                    static_cast<size_t>(rank);
+                const auto &bbox = host_final_bboxes[flat_index];
+                const cv::Scalar color(0, 255, 0);
 
                 const int x1 = std::clamp(static_cast<int>(bbox.x) + offset_x, 0, visual_width - 1);
                 const int y1 = std::clamp(static_cast<int>(bbox.y) + offset_y, 0, visual_height - 1);
@@ -584,6 +626,101 @@ std::vector<DetectionBox> DetectionModelInferenceHelper::getLastDetections(Detec
     return detections;
 }
 
+WarpedFaceBatch DetectionModelInferenceHelper::getLastWarpedFaces(DetectionType detection_type)
+{
+    const int batch = batchSizeForDetectionType(detection_type);
+    const size_t face_elements =
+        static_cast<size_t>(kWarpedFaceChannels) * kWarpedFaceSize * kWarpedFaceSize;
+
+    launchEstimateSimilarityKernel(batch, detection_type, stream_);
+    checkCuda(cudaGetLastError(), "Failed to launch detection estimate similarity kernel");
+    launchWarpAffineKernel(batch, detection_type, stream_);
+    checkCuda(cudaGetLastError(), "Failed to launch detection warp affine kernel");
+    checkCuda(cudaStreamSynchronize(stream_), "Failed to synchronize detection warped faces");
+
+    std::vector<int32_t> host_counts(static_cast<size_t>(batch));
+    checkCuda(cudaMemcpy(host_counts.data(),
+                         device_final_num_detections_,
+                         host_counts.size() * sizeof(int32_t),
+                         cudaMemcpyDeviceToHost),
+              "Failed to copy detection final counts for warped faces");
+
+    int total_count = 0;
+    for (int batch_index = 0; batch_index < batch; ++batch_index)
+    {
+        total_count += std::min(host_counts[static_cast<size_t>(batch_index)], detection_top_k_);
+    }
+
+    WarpedFaceBatch result;
+    result.count = total_count;
+    if (total_count <= 0)
+    {
+        return result;
+    }
+
+    result.faces.resize(static_cast<size_t>(total_count) * face_elements);
+    size_t write_offset = 0;
+    for (int batch_index = 0; batch_index < batch; ++batch_index)
+    {
+        const int count = std::min(host_counts[static_cast<size_t>(batch_index)], detection_top_k_);
+        if (count <= 0)
+        {
+            continue;
+        }
+
+        const size_t read_offset =
+            static_cast<size_t>(batch_index) *
+            static_cast<size_t>(detection_top_k_) *
+            face_elements;
+        const size_t copy_elements =
+            static_cast<size_t>(count) * face_elements;
+
+        checkCuda(cudaMemcpy(result.faces.data() + write_offset,
+                             device_warped_faces_ + read_offset,
+                             copy_elements * sizeof(float),
+                             cudaMemcpyDeviceToHost),
+                  "Failed to copy filtered warped faces to host");
+        write_offset += copy_elements;
+    }
+
+    return result;
+}
+
+DeviceWarpedFaceBatch DetectionModelInferenceHelper::getDeviceWarpedFacesForIdentification(DetectionType detection_type)
+{
+    const int batch = batchSizeForDetectionType(detection_type);
+
+    launchEstimateSimilarityKernel(batch, detection_type, stream_);
+    checkCuda(cudaGetLastError(), "Failed to launch detection estimate similarity kernel");
+    launchWarpAffineKernel(batch, detection_type, stream_);
+    checkCuda(cudaGetLastError(), "Failed to launch detection warp affine kernel");
+    launchPreprocessWarpedFacesForIdentificationKernel(batch, stream_);
+    checkCuda(cudaGetLastError(), "Failed to launch detection warped face identification preprocess kernel");
+
+    DeviceWarpedFaceBatch result;
+    checkCuda(cudaMemcpyAsync(host_identification_counts_.data(),
+                              device_final_num_detections_,
+                              static_cast<size_t>(batch) * sizeof(int32_t),
+                              cudaMemcpyDeviceToHost,
+                              stream_),
+              "Failed to copy detection final counts for identification");
+    checkCuda(cudaStreamSynchronize(stream_), "Failed to synchronize detection final counts for identification");
+
+    int total_count = 0;
+    for (int batch_index = 0; batch_index < batch; ++batch_index)
+    {
+        host_identification_counts_[static_cast<size_t>(batch_index)] =
+            std::min(host_identification_counts_[static_cast<size_t>(batch_index)], detection_top_k_);
+        total_count += host_identification_counts_[static_cast<size_t>(batch_index)];
+    }
+
+    result.count = total_count;
+    result.batch_count = batch;
+    result.batch_counts = host_identification_counts_.data();
+    result.device_faces = device_warped_faces_identification_;
+    return result;
+}
+
 void DetectionModelInferenceHelper::bindTensorAddresses(IExecutionContext *context, const char *context_name)
 {
     // Both execution contexts reuse the same backing buffers, but each context must
@@ -707,6 +844,19 @@ void DetectionModelInferenceHelper::allocateBuffers() {
     cudaMalloc(&device_final_bboxes_, postprocess_capacity * sizeof(float4));
     cudaMalloc(&device_final_landmarks_, postprocess_capacity * kLandmarkCount * sizeof(float2));
     cudaMalloc(&device_final_num_detections_, static_cast<size_t>(batch_sizes_[2]) * sizeof(int32_t));
+    cudaMalloc(&device_similarity_transforms_, postprocess_capacity * 6 * sizeof(float));
+    cudaMalloc(&device_warped_faces_,
+               postprocess_capacity *
+                   static_cast<size_t>(kWarpedFaceChannels) *
+                   static_cast<size_t>(kWarpedFaceSize) *
+                   static_cast<size_t>(kWarpedFaceSize) *
+                   sizeof(float));
+    cudaMalloc(&device_warped_faces_identification_,
+               postprocess_capacity *
+                   static_cast<size_t>(kWarpedFaceChannels) *
+                   static_cast<size_t>(kWarpedFaceSize) *
+                   static_cast<size_t>(kWarpedFaceSize) *
+                   sizeof(float));
     memory_usage += (postprocess_capacity * sizeof(float) +
                      postprocess_capacity * sizeof(int32_t) +
                      postprocess_capacity * sizeof(float) +
@@ -718,6 +868,17 @@ void DetectionModelInferenceHelper::allocateBuffers() {
                      postprocess_capacity * sizeof(int32_t) +
                      postprocess_capacity * sizeof(float4) +
                      postprocess_capacity * kLandmarkCount * sizeof(float2) +
+                     postprocess_capacity * 6 * sizeof(float) +
+                     postprocess_capacity *
+                         static_cast<size_t>(kWarpedFaceChannels) *
+                         static_cast<size_t>(kWarpedFaceSize) *
+                         static_cast<size_t>(kWarpedFaceSize) *
+                         sizeof(float) +
+                     postprocess_capacity *
+                         static_cast<size_t>(kWarpedFaceChannels) *
+                         static_cast<size_t>(kWarpedFaceSize) *
+                         static_cast<size_t>(kWarpedFaceSize) *
+                         sizeof(float) +
                      static_cast<size_t>(batch_sizes_[2]) * sizeof(int32_t) +
                      static_cast<size_t>(batch_sizes_[2]) * sizeof(int32_t)) /
                     (1024.0 * 1024.0);
@@ -848,6 +1009,24 @@ void DetectionModelInferenceHelper::freeBuffers()
         device_final_num_detections_ = nullptr;
     }
 
+    if (device_similarity_transforms_)
+    {
+        cudaFree(device_similarity_transforms_);
+        device_similarity_transforms_ = nullptr;
+    }
+
+    if (device_warped_faces_)
+    {
+        cudaFree(device_warped_faces_);
+        device_warped_faces_ = nullptr;
+    }
+
+    if (device_warped_faces_identification_)
+    {
+        cudaFree(device_warped_faces_identification_);
+        device_warped_faces_identification_ = nullptr;
+    }
+
     if (device_sort_storage_)
     {
         cudaFree(device_sort_storage_);
@@ -884,10 +1063,18 @@ void DetectionModelInferenceHelper::stageUploadHostImage(const uint8_t *host_ima
 
     if (detection_type == DetectionType::SEARCH)
     {
+        if (host_image == host_jetson_input_buffer_search_uint8_t_)
+        {
+            return;
+        }
         std::memcpy(host_jetson_input_buffer_search_uint8_t_, host_image, input_buffer_size_search_uint8_t_);
         return;
     }
 
+    if (host_image == host_jetson_input_buffer_track_uint8_t_)
+    {
+        return;
+    }
     std::memcpy(host_jetson_input_buffer_track_uint8_t_, host_image, input_buffer_size_track_uint8_t_);
 }
 

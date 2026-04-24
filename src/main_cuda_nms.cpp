@@ -85,7 +85,7 @@ void deserializeDetectionEngine(const std::string &model_path_, nvinfer1::IRunti
     LOG_INFO("TensorRT Engine deserialized successfully, engine size: {} mb", engine_size / (1024.0 * 1024.0));
 }
 
-void deserializeInferenceEngine(const std::string model_path, nvinfer1::IRuntime *&runtime_identification, nvinfer1::ICudaEngine *&engine_identification)
+void deserializeIdentificationEngine(const std::string model_path, nvinfer1::IRuntime *&runtime_identification, nvinfer1::ICudaEngine *&engine_identification)
 {
     LOG_INFO("*******************************************************");
     LOG_INFO("Deserializing TensorRT Engine from file: {}", model_path);
@@ -165,7 +165,7 @@ int main(int argc, char **argv)
     nvinfer1::ICudaEngine *iCudaEngineIdentification = nullptr;
 
     deserializeDetectionEngine(data_config["detection"]["model_path"], iRuntimeDetection, iCudaEngineDetection);
-    deserializeInferenceEngine(data_config["identification"]["model_path"], iRuntimeIdentification, iCudaEngineIdentification);
+    deserializeIdentificationEngine(data_config["identification"]["model_path"], iRuntimeIdentification, iCudaEngineIdentification);
 
     std::vector<int> batch_sizes = data_config["detection"]["batch_sizes"].get<std::vector<int>>();
     std::vector<int> identification_batch_sizes =
@@ -177,6 +177,8 @@ int main(int argc, char **argv)
     float confidence_threshold = data_config["detection"]["detection_conf_threshold"];
     float iou_threshold = data_config["detection"]["detection_nms_threshold"];
     int32_t min_box_length = data_config["identification"]["identifier_threshold_min_box_length"];
+    int32_t identification_input_size = data_config["identification"]["input_size"];
+    float face_threshold = data_config["identification"].value("face_threshold", 0.4f);
     int32_t camera_height = data_config["camera"]["height"];
     int32_t camera_width = data_config["camera"]["width"];
     double time_interval_face_record = data_config["camera"].value("time_interval_face_record", 1.0);
@@ -194,6 +196,15 @@ int main(int argc, char **argv)
              identification_batch_sizes[1],
              identification_batch_sizes[2]);
 
+    auto project_root = std::filesystem::current_path();
+    if (project_root.filename() == "build")
+    {
+        project_root = project_root.parent_path();
+    }
+    const std::string selected_faces_path = data_config["identification"].value(
+        "selected_faces_path",
+        (project_root / "selected_faces").string());
+
     DetectionModelInferenceHelper inferenceHelper(
         iCudaEngineDetection,
         batch_sizes,
@@ -210,6 +221,17 @@ int main(int argc, char **argv)
         gap_x,
         gap_y,
         min_box_length);
+
+    IdentificationModelInferenceHelper identificationHelper(
+        iCudaEngineIdentification,
+        identification_batch_sizes[2],
+        identification_input_size,
+        identification_input_size,
+        selected_faces_path,
+        inferenceHelper.stream());
+    LOG_INFO("Identification DB ready on GPU with {} faces from {}",
+             identificationHelper.dbCount(),
+             selected_faces_path);
     
     std::filesystem::path face_record_dir;
     int face_record_index = 0;
@@ -234,75 +256,106 @@ int main(int argc, char **argv)
         return -1;
     }
 
+    cv::Mat zero_copy_frame(
+        camera_height,
+        camera_width,
+        CV_8UC3,
+        inferenceHelper.hostInputBuffer(DetectionType::SEARCH));
     const double video_fps = cap.get(cv::CAP_PROP_FPS);
     int frame_index = 0;
+    double elapsed_sum_ms = 0.0;
+    double elapsed_min_ms = std::numeric_limits<double>::max();
+    double elapsed_max_ms = 0.0;
     cv::Mat frame;
     while (cap.read(frame)) {
         if (frame.empty()) {
             LOG_ERROR("Failed to read frame from video");
             break;
         }
-        cv::resize(frame, frame, cv::Size(camera_width, camera_height));
+        cv::resize(frame, zero_copy_frame, cv::Size(camera_width, camera_height));
         auto start_time = std::chrono::high_resolution_clock::now();
 
         if (face_record_mode)
         {
-            inferenceHelper.infer(frame.data, DetectionType::SEARCH);
+            inferenceHelper.infer(zero_copy_frame.data, DetectionType::SEARCH);
 
             const double frame_time_sec =
                 video_fps > 0.0 ? static_cast<double>(frame_index) / video_fps : static_cast<double>(frame_index);
             if (frame_time_sec - last_face_record_time >= time_interval_face_record)
             {
                 int saved_count = 0;
-                const auto detections = inferenceHelper.getLastDetections(DetectionType::SEARCH);
-                const cv::Rect frame_rect(0, 0, frame.cols, frame.rows);
+                const auto warped_faces = inferenceHelper.getLastWarpedFaces(DetectionType::SEARCH);
+                const size_t face_elements =
+                    static_cast<size_t>(DetectionModelInferenceHelper::kWarpedFaceChannels) *
+                    static_cast<size_t>(DetectionModelInferenceHelper::kWarpedFaceSize) *
+                    static_cast<size_t>(DetectionModelInferenceHelper::kWarpedFaceSize);
 
-                for (const auto &detection : detections)
+                for (int face_index = 0; face_index < warped_faces.count; ++face_index)
                 {
-                    cv::Rect crop_rect(
-                        detection.x1,
-                        detection.y1,
-                        detection.x2 - detection.x1,
-                        detection.y2 - detection.y1);
-                    crop_rect &= frame_rect;
-
-                    if (crop_rect.width < min_box_length || crop_rect.height < min_box_length)
+                    cv::Mat warped(
+                        DetectionModelInferenceHelper::kWarpedFaceSize,
+                        DetectionModelInferenceHelper::kWarpedFaceSize,
+                        CV_8UC3);
+                    const size_t face_offset = static_cast<size_t>(face_index) * face_elements;
+                    auto *dst = warped.ptr<uint8_t>();
+                    for (size_t i = 0; i < face_elements; ++i)
                     {
-                        continue;
+                        dst[i] = cv::saturate_cast<uint8_t>(warped_faces.faces[face_offset + i]);
                     }
 
                     const auto crop_path =
                         face_record_dir / ("face_" + std::to_string(face_record_index++) + ".jpg");
-                    if (cv::imwrite(crop_path.string(), frame(crop_rect).clone()))
+                    if (cv::imwrite(crop_path.string(), warped))
                     {
                         ++saved_count;
                     }
                 }
 
                 last_face_record_time = frame_time_sec;
-                LOG_INFO("Recorded {} face crops at {:.2f}s", saved_count, frame_time_sec);
+                LOG_INFO("Recorded {} warped faces at {:.2f}s", saved_count, frame_time_sec);
             }
         }
         else
         {
-            const cv::Rect track_crop_rect((frame.cols - width) / 2,
-                                           (frame.rows - height) / 2,
-                                           width,
-                                           height);
-            cv::Mat track_crop = frame(track_crop_rect).clone();
-            inferenceHelper.infer(track_crop.data,
-                                  DetectionType::TRACK,
-                                  frame.data,
-                                  frame.cols,
-                                  frame.rows,
-                                  track_crop_rect.x,
-                                  track_crop_rect.y);
+            inferenceHelper.infer(zero_copy_frame.data, DetectionType::SEARCH);
+            const auto warped_faces = inferenceHelper.getDeviceWarpedFacesForIdentification(DetectionType::SEARCH);
+            const auto matches = identificationHelper.matchWarpedFaces(
+                warped_faces.device_faces,
+                warped_faces.batch_counts,
+                warped_faces.batch_count,
+                top_k,
+                face_threshold);
+
+            for (const auto &match : matches)
+            {
+                LOG_INFO("Detection match: face_index={}, label={}, average_similarity={:.4f}",
+                         match.face_index,
+                         match.label,
+                         match.average_similarity);
+            }
+
+            if (!matches.empty())
+            {
+                cv::imshow("Detection", zero_copy_frame);
+                cv::waitKey(0);
+            }
         }
 
         auto end_time = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = end_time - start_time;
-        LOG_INFO("Inference Mode: {}, Elp Time: {:.2f} ms", face_record_mode ? "SEARCH" : "TRACK", elapsed.count() * 1000);
+        const double elapsed_ms = elapsed.count() * 1000.0;
+        elapsed_sum_ms += elapsed_ms;
+        elapsed_min_ms = std::min(elapsed_min_ms, elapsed_ms);
+        elapsed_max_ms = std::max(elapsed_max_ms, elapsed_ms);
         ++frame_index;
+        if (frame_index % 50 == 0)
+        {
+            LOG_INFO("Inference time (last 50): min={:.2f} mean={:.2f} max={:.2f} ms",
+                     elapsed_min_ms, elapsed_sum_ms / 50.0, elapsed_max_ms);
+            elapsed_sum_ms = 0.0;
+            elapsed_min_ms = std::numeric_limits<double>::max();
+            elapsed_max_ms = 0.0;
+        }
     }
 
     /*

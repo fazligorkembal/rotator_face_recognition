@@ -27,7 +27,8 @@
     "identification": {
         "model_path": "/home/user/Documents/rfr/models/r50.engine",
         "input_size": 112,
-        "identifier_threshold_min_box_length": 40,
-        "batch_sizes": [1, 1, 8]
+        "identifier_threshold_min_box_length": 20,
+        "batch_sizes": [1, 1, 8],
+        "face_threshold": 0.6
     }
 }

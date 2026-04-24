@@ -25,6 +25,8 @@ add_executable(main
     src/main_cuda_nms.cpp
     src/detection_model_inference_helper.cpp
     src/detection_model_inference_helper.cu
+    src/identification_model_inference_helper.cpp
+    src/identification_model_inference_helper.cu
 )
 
 set(COMMON_LIBS
@@ -33,6 +35,7 @@ set(COMMON_LIBS
     nvinfer_plugin
     nvonnxparser
     CUDA::cudart
+    CUDA::cublas
     ${OpenCV_LIBS}
 )
 
