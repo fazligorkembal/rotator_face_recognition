@@ -276,11 +276,14 @@ int main(int argc, char **argv)
     const int lock_max_x = camera_width / 2 + width / 2;
     const int lock_min_y = camera_height / 2 - height / 2;
     const int lock_max_y = camera_height / 2 + height / 2;
+    const cv::Size camera_size(camera_width, camera_height);
     bool tracking_active = false;
     std::string tracked_label;
 
     const double video_fps = cap.get(cv::CAP_PROP_FPS);
     int frame_index = 0;
+    int report_search_frames = 0;
+    int report_track_frames = 0;
     double elapsed_sum_ms = 0.0;
     double elapsed_min_ms = std::numeric_limits<double>::max();
     double elapsed_max_ms = 0.0;
@@ -290,7 +293,32 @@ int main(int argc, char **argv)
             LOG_ERROR("Failed to read frame from video");
             break;
         }
-        cv::resize(frame, zero_copy_frame, cv::Size(camera_width, camera_height));
+        const bool run_track_mode = !face_record_mode && tracking_active;
+        const bool frame_is_camera_size =
+            frame.cols == camera_width && frame.rows == camera_height;
+
+        // Prepare only the input needed by this frame's mode.
+        if (run_track_mode)
+        {
+            if (frame_is_camera_size)
+            {
+                frame(tracking_crop_rect).copyTo(zero_copy_track_crop);
+            }
+            else
+            {
+                cv::resize(frame, zero_copy_frame, camera_size);
+                zero_copy_frame(tracking_crop_rect).copyTo(zero_copy_track_crop);
+            }
+        }
+        else if (frame_is_camera_size)
+        {
+            frame.copyTo(zero_copy_frame);
+        }
+        else
+        {
+            cv::resize(frame, zero_copy_frame, camera_size);
+        }
+
         auto start_time = std::chrono::high_resolution_clock::now();
 
         if (face_record_mode)
@@ -333,70 +361,68 @@ int main(int argc, char **argv)
                 LOG_INFO("Recorded {} warped faces at {:.2f}s", saved_count, frame_time_sec);
             }
         }
-        else
+        else if (run_track_mode)
         {
-            if (tracking_active)
+            // TRACK: identify faces only inside the center crop and keep the same target label.
+            inferenceHelper.infer(zero_copy_track_crop.data, DetectionType::TRACK);
+            const auto warped_faces = inferenceHelper.getDeviceWarpedFacesForIdentification(DetectionType::TRACK);
+            const auto matches = identificationHelper.matchWarpedFaces(
+                warped_faces.device_faces,
+                warped_faces.batch_counts,
+                warped_faces.batch_count,
+                top_k,
+                face_threshold);
+
+            bool target_found = false;
+            for (const auto &match : matches)
             {
-                zero_copy_frame(tracking_crop_rect).copyTo(zero_copy_track_crop);
-                inferenceHelper.infer(zero_copy_track_crop.data, DetectionType::TRACK);
-                const auto warped_faces = inferenceHelper.getDeviceWarpedFacesForIdentification(DetectionType::TRACK);
-                const auto matches = identificationHelper.matchWarpedFaces(
-                    warped_faces.device_faces,
-                    warped_faces.batch_counts,
-                    warped_faces.batch_count,
-                    top_k,
-                    face_threshold);
-
-                bool target_found = false;
-                for (const auto &match : matches)
+                if (match.label == tracked_label)
                 {
-                    if (match.label == tracked_label)
-                    {
-                        target_found = true;
-                        break;
-                    }
-                }
-
-                if (!target_found)
-                {
-                    tracking_active = false;
-                    is_tracking.store(false);
-                    tracked_label.clear();
+                    target_found = true;
+                    break;
                 }
             }
-            else
+
+            if (!target_found)
             {
-                inferenceHelper.infer(zero_copy_frame.data, DetectionType::SEARCH);
-                const auto warped_faces = inferenceHelper.getDeviceWarpedFacesForIdentification(DetectionType::SEARCH);
-                const auto matches = identificationHelper.matchWarpedFaces(
-                    warped_faces.device_faces,
-                    warped_faces.batch_counts,
-                    warped_faces.batch_count,
-                    top_k,
-                    face_threshold);
+                tracking_active = false;
+                is_tracking.store(false);
+                tracked_label.clear();
+            }
+        }
+        else
+        {
+            // SEARCH: scan the full frame, then start tracking only if the match is near center.
+            inferenceHelper.infer(zero_copy_frame.data, DetectionType::SEARCH);
+            const auto warped_faces = inferenceHelper.getDeviceWarpedFacesForIdentification(DetectionType::SEARCH);
+            const auto matches = identificationHelper.matchWarpedFaces(
+                warped_faces.device_faces,
+                warped_faces.batch_counts,
+                warped_faces.batch_count,
+                top_k,
+                face_threshold);
 
-                if (!matches.empty())
+            if (!matches.empty())
+            {
+                const auto detections = inferenceHelper.getLastDetections(DetectionType::SEARCH);
+                for (const auto &match : matches)
                 {
-                    const auto detections = inferenceHelper.getLastDetections(DetectionType::SEARCH);
-                    for (const auto &match : matches)
+                    if (match.face_index < 0 ||
+                        match.face_index >= static_cast<int>(detections.size()))
                     {
-                        if (match.face_index < 0 ||
-                            match.face_index >= static_cast<int>(detections.size()))
-                        {
-                            continue;
-                        }
+                        continue;
+                    }
 
-                        const auto &box = detections[static_cast<size_t>(match.face_index)];
-                        const int center_x = (box.x1 + box.x2) / 2;
-                        const int center_y = (box.y1 + box.y2) / 2;
-                        if (center_x >= lock_min_x && center_x <= lock_max_x &&
-                            center_y >= lock_min_y && center_y <= lock_max_y)
-                        {
-                            tracking_active = true;
-                            is_tracking.store(true);
-                            tracked_label = match.label;
-                            break;
-                        }
+                    const auto &box = detections[static_cast<size_t>(match.face_index)];
+                    const int center_x = (box.x1 + box.x2) / 2;
+                    const int center_y = (box.y1 + box.y2) / 2;
+                    if (center_x >= lock_min_x && center_x <= lock_max_x &&
+                        center_y >= lock_min_y && center_y <= lock_max_y)
+                    {
+                        tracking_active = true;
+                        is_tracking.store(true);
+                        tracked_label = match.label;
+                        break;
                     }
                 }
             }
@@ -408,14 +434,38 @@ int main(int argc, char **argv)
         elapsed_sum_ms += elapsed_ms;
         elapsed_min_ms = std::min(elapsed_min_ms, elapsed_ms);
         elapsed_max_ms = std::max(elapsed_max_ms, elapsed_ms);
+        if (run_track_mode)
+        {
+            ++report_track_frames;
+        }
+        else
+        {
+            ++report_search_frames;
+        }
         ++frame_index;
         if (frame_index % 50 == 0)
         {
+            const char *report_mode = "SEARCH";
+            if (face_record_mode)
+            {
+                report_mode = "FACE_RECORD";
+            }
+            else if (report_track_frames > 0 && report_search_frames > 0)
+            {
+                report_mode = "MIXED";
+            }
+            else if (report_track_frames > 0)
+            {
+                report_mode = "TRACK";
+            }
+
             LOG_INFO("Inference time (last 50): mode={} min={:.2f} mean={:.2f} max={:.2f} ms",
-                     tracking_active ? "TRACK" : "SEARCH",
+                     report_mode,
                      elapsed_min_ms,
                      elapsed_sum_ms / 50.0,
                      elapsed_max_ms);
+            report_search_frames = 0;
+            report_track_frames = 0;
             elapsed_sum_ms = 0.0;
             elapsed_min_ms = std::numeric_limits<double>::max();
             elapsed_max_ms = 0.0;
