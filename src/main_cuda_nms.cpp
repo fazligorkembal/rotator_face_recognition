@@ -8,6 +8,7 @@
 #include <string_view>
 #include <filesystem>
 #include <limits>
+#include <sstream>
 
 #include <opencv2/opencv.hpp>
 #include "tensorrt/logging.h"
@@ -143,7 +144,36 @@ void deserializeIdentificationEngine(const std::string model_path, nvinfer1::IRu
 int main(int argc, char **argv)
 {
     LOG_INFO("Starting face recognition with CUDA NMS");
-    const bool face_record_mode = argc >= 2 && std::string_view(argv[1]) == "face_record";
+    bool face_record_mode = false;
+    bool use_camera_source = false;
+    bool use_video_source = false;
+    for (int arg_index = 1; arg_index < argc; ++arg_index)
+    {
+        const std::string_view arg(argv[arg_index]);
+        if (arg == "face_record")
+        {
+            face_record_mode = true;
+        }
+        else if (arg == "cam")
+        {
+            use_camera_source = true;
+        }
+        else if (arg == "video")
+        {
+            use_video_source = true;
+        }
+    }
+
+    if (use_camera_source && use_video_source)
+    {
+        LOG_ERROR("Use only one source parameter: 'cam' or 'video'");
+        return -1;
+    }
+
+    if (!use_camera_source && !use_video_source)
+    {
+        use_video_source = true;
+    }
 
     // ----- Load configuration -----
     nlohmann::json data_config;
@@ -249,12 +279,44 @@ int main(int argc, char **argv)
         LOG_INFO("Face record mode enabled. Saving crops to {}", face_record_dir.string());
     }
 
-    //read opencv video
-    std::string video_path = data_config["camera"]["test_video_path"];
-    cv::VideoCapture cap(video_path);
-    if (!cap.isOpened()) {
-        LOG_ERROR("Failed to open video: {}", video_path);
-        return -1;
+    cv::VideoCapture cap;
+    if (use_camera_source)
+    {
+        const int32_t camera_fps = data_config["camera"].value("fps", 30);
+        const int32_t sensor_id = data_config["camera"].value("sensor_id", 0);
+        const std::string camera_pipeline = data_config["camera"].value(
+            "pipeline",
+            [&]() {
+                std::ostringstream pipeline;
+                pipeline
+                    << "nvarguscamerasrc sensor-id=" << sensor_id << " ! "
+                    << "video/x-raw(memory:NVMM), width=" << camera_width
+                    << ", height=" << camera_height
+                    << ", framerate=" << camera_fps << "/1, format=NV12 ! "
+                    << "nvvidconv ! video/x-raw, format=BGRx ! "
+                    << "videoconvert ! video/x-raw, format=BGR ! "
+                    << "appsink drop=true max-buffers=1 sync=false";
+                return pipeline.str();
+            }());
+
+        LOG_INFO("Opening camera pipeline: {}", camera_pipeline);
+        cap.open(camera_pipeline, cv::CAP_GSTREAMER);
+        if (!cap.isOpened())
+        {
+            LOG_ERROR("Failed to open camera pipeline");
+            return -1;
+        }
+    }
+    else
+    {
+        const std::string video_path = data_config["camera"]["test_video_path"];
+        LOG_INFO("Opening video: {}", video_path);
+        cap.open(video_path);
+        if (!cap.isOpened())
+        {
+            LOG_ERROR("Failed to open video: {}", video_path);
+            return -1;
+        }
     }
 
     cv::Mat zero_copy_frame(

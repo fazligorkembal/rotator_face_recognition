@@ -9,6 +9,8 @@ services:
     runtime: nvidia
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /tmp/argus_socket:/tmp/argus_socket
+      - /dev:/dev
       - ../:/home/user/Documents/rfr
       - ../../../datasets/rfr:/home/user/Documents/rfr/datasets/rfr
       - ../../../models/rfr:/home/user/Documents/rfr/models

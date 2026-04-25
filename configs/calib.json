@@ -7,6 +7,8 @@
         "test_video_path": "/home/user/Documents/rfr/datasets/rfr/videos/video1.webm",
         "width": 1920,
         "height": 1080, 
+        "fps": 30,
+        "sensor_id": 0,
         "time_interval_face_record": 1.0
     },
     "detection": {
@@ -14,7 +16,7 @@
         "test_image_path": "/home/user/Documents/rfr/datasets/rfr/test1.png",
         
         "input_size": 640,
-        "detection_top_k": 128,
+        "detection_top_k": 32,
         "detection_conf_threshold": 0.5,
         "detection_nms_threshold": 0.4,
         "batch_sizes": [1, 6, 6],

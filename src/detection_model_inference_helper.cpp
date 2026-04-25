@@ -320,9 +320,10 @@ void DetectionModelInferenceHelper::infer(const uint8_t *host_image,
         const std::string window_name =
             std::string("detection_") + detectionTypeName(detection_type) + "_display";
         cv::namedWindow(window_name, cv::WINDOW_NORMAL);
+        cv::resizeWindow(window_name, visual_width, visual_height);
         cv::imshow(window_name, visual);
         cv::waitKey(1);
-        LOG_INFO("Displayed frame resolution: {}x{}", visual_width, visual_height);
+        // LOG_INFO("Displayed frame resolution: {}x{}", visual_width, visual_height);
     }
 #endif
 
@@ -784,8 +785,10 @@ void DetectionModelInferenceHelper::allocateBuffers() {
     // Search mode reads the full camera frame directly from mapped pinned memory.
     input_buffer_size_search_uint8_t_ =
         static_cast<size_t>(camera_input_height_) * camera_input_width_ * 3 * sizeof(uint8_t);
-    cudaHostAlloc(&host_jetson_input_buffer_search_uint8_t_, input_buffer_size_search_uint8_t_, cudaHostAllocMapped);
-    cudaHostGetDevicePointer(&device_jetson_ptr_search_uint8_t_, host_jetson_input_buffer_search_uint8_t_, 0);
+    checkCuda(cudaHostAlloc(&host_jetson_input_buffer_search_uint8_t_, input_buffer_size_search_uint8_t_, cudaHostAllocMapped),
+              "Failed to allocate pinned search input buffer");
+    checkCuda(cudaHostGetDevicePointer(&device_jetson_ptr_search_uint8_t_, host_jetson_input_buffer_search_uint8_t_, 0),
+              "Failed to get device pointer for search input buffer");
     memory_usage += input_buffer_size_search_uint8_t_ / (1024.0 * 1024.0);
     LOG_DEBUG("\t\thost_jetson_input_buffer_search_uint8_t_ allocated with size: {} mb",
               input_buffer_size_search_uint8_t_ / (1024.0 * 1024.0));
@@ -793,15 +796,18 @@ void DetectionModelInferenceHelper::allocateBuffers() {
     // Track mode keeps a dedicated single-crop buffer so its input meaning stays fixed for cudaGraph capture.
     input_buffer_size_track_uint8_t_ =
         static_cast<size_t>(model_input_height_) * model_input_width_ * 3 * sizeof(uint8_t);
-    cudaHostAlloc(&host_jetson_input_buffer_track_uint8_t_, input_buffer_size_track_uint8_t_, cudaHostAllocMapped);
-    cudaHostGetDevicePointer(&device_jetson_ptr_track_uint8_t_, host_jetson_input_buffer_track_uint8_t_, 0);
+    checkCuda(cudaHostAlloc(&host_jetson_input_buffer_track_uint8_t_, input_buffer_size_track_uint8_t_, cudaHostAllocMapped),
+              "Failed to allocate pinned track input buffer");
+    checkCuda(cudaHostGetDevicePointer(&device_jetson_ptr_track_uint8_t_, host_jetson_input_buffer_track_uint8_t_, 0),
+              "Failed to get device pointer for track input buffer");
     memory_usage += input_buffer_size_track_uint8_t_ / (1024.0 * 1024.0);
     LOG_DEBUG("\t\thost_jetson_input_buffer_track_uint8_t_ allocated with size: {} mb",
               input_buffer_size_track_uint8_t_ / (1024.0 * 1024.0));
 
     // float32 CHW buffer: preprocessing kernel writes here, TensorRT reads from here
     input_buffer_size_float_   = static_cast<size_t>(batch_sizes_[2]) * 3 * model_input_height_ * model_input_width_ * sizeof(float);
-    cudaMalloc(&device_jetson_input_buffer_float_, input_buffer_size_float_);
+    checkCuda(cudaMalloc(&device_jetson_input_buffer_float_, input_buffer_size_float_),
+              "Failed to allocate device float input buffer");
     memory_usage += input_buffer_size_float_ / (1024.0 * 1024.0);
     LOG_DEBUG("\t\tdevice_jetson_input_buffer_float_ allocated with size: {} mb", input_buffer_size_float_ / (1024.0 * 1024.0));
 
@@ -819,7 +825,8 @@ void DetectionModelInferenceHelper::allocateBuffers() {
         output_element_counts_[i] = output_elements;
         output_elements_per_batch_[i] = output_elements / static_cast<size_t>(batch_size_cuda_graph_search_mode_);
 
-        cudaMalloc(&device_model_output_buffers_[i], output_buffer_size);
+        checkCuda(cudaMalloc(&device_model_output_buffers_[i], output_buffer_size),
+                  "Failed to allocate model output buffer");
         memory_usage += output_buffer_size / (1024.0 * 1024.0);
         LOG_DEBUG("\t\tdevice_model_output_buffers_[{}] allocated with shape volume {} and size: {} mb",
                   i,
@@ -831,32 +838,44 @@ void DetectionModelInferenceHelper::allocateBuffers() {
         static_cast<size_t>(batch_sizes_[2]) * static_cast<size_t>(detection_top_k_);
     const size_t suppression_mask_words =
         static_cast<size_t>(batch_sizes_[2]) * static_cast<size_t>((detection_top_k_ + 31) / 32);
-    cudaMalloc(&device_filtered_scores_, postprocess_capacity * sizeof(float));
-    cudaMalloc(&device_filtered_indexes_, postprocess_capacity * sizeof(int32_t));
-    cudaMalloc(&device_sorted_scores_, postprocess_capacity * sizeof(float));
-    cudaMalloc(&device_sorted_indexes_, postprocess_capacity * sizeof(int32_t));
-    cudaMalloc(&device_sorted_bboxes_, postprocess_capacity * sizeof(float4));
-    cudaMalloc(&device_sorted_landmarks_, postprocess_capacity * kLandmarkCount * sizeof(float2));
-    cudaMalloc(&device_suppression_mask_, suppression_mask_words * sizeof(uint32_t));
-    cudaMalloc(&device_num_selected_, static_cast<size_t>(batch_sizes_[2]) * sizeof(int32_t));
-    cudaMalloc(&device_final_scores_, postprocess_capacity * sizeof(float));
-    cudaMalloc(&device_final_indexes_, postprocess_capacity * sizeof(int32_t));
-    cudaMalloc(&device_final_bboxes_, postprocess_capacity * sizeof(float4));
-    cudaMalloc(&device_final_landmarks_, postprocess_capacity * kLandmarkCount * sizeof(float2));
-    cudaMalloc(&device_final_num_detections_, static_cast<size_t>(batch_sizes_[2]) * sizeof(int32_t));
-    cudaMalloc(&device_similarity_transforms_, postprocess_capacity * 6 * sizeof(float));
-    cudaMalloc(&device_warped_faces_,
-               postprocess_capacity *
-                   static_cast<size_t>(kWarpedFaceChannels) *
-                   static_cast<size_t>(kWarpedFaceSize) *
-                   static_cast<size_t>(kWarpedFaceSize) *
-                   sizeof(float));
-    cudaMalloc(&device_warped_faces_identification_,
-               postprocess_capacity *
-                   static_cast<size_t>(kWarpedFaceChannels) *
-                   static_cast<size_t>(kWarpedFaceSize) *
-                   static_cast<size_t>(kWarpedFaceSize) *
-                   sizeof(float));
+    checkCuda(cudaMalloc(&device_filtered_scores_, postprocess_capacity * sizeof(float)),
+              "Failed to allocate device_filtered_scores_");
+    checkCuda(cudaMalloc(&device_filtered_indexes_, postprocess_capacity * sizeof(int32_t)),
+              "Failed to allocate device_filtered_indexes_");
+    checkCuda(cudaMalloc(&device_sorted_scores_, postprocess_capacity * sizeof(float)),
+              "Failed to allocate device_sorted_scores_");
+    checkCuda(cudaMalloc(&device_sorted_indexes_, postprocess_capacity * sizeof(int32_t)),
+              "Failed to allocate device_sorted_indexes_");
+    checkCuda(cudaMalloc(&device_sorted_bboxes_, postprocess_capacity * sizeof(float4)),
+              "Failed to allocate device_sorted_bboxes_");
+    checkCuda(cudaMalloc(&device_sorted_landmarks_, postprocess_capacity * kLandmarkCount * sizeof(float2)),
+              "Failed to allocate device_sorted_landmarks_");
+    checkCuda(cudaMalloc(&device_suppression_mask_, suppression_mask_words * sizeof(uint32_t)),
+              "Failed to allocate device_suppression_mask_");
+    checkCuda(cudaMalloc(&device_num_selected_, static_cast<size_t>(batch_sizes_[2]) * sizeof(int32_t)),
+              "Failed to allocate device_num_selected_");
+    checkCuda(cudaMalloc(&device_final_scores_, postprocess_capacity * sizeof(float)),
+              "Failed to allocate device_final_scores_");
+    checkCuda(cudaMalloc(&device_final_indexes_, postprocess_capacity * sizeof(int32_t)),
+              "Failed to allocate device_final_indexes_");
+    checkCuda(cudaMalloc(&device_final_bboxes_, postprocess_capacity * sizeof(float4)),
+              "Failed to allocate device_final_bboxes_");
+    checkCuda(cudaMalloc(&device_final_landmarks_, postprocess_capacity * kLandmarkCount * sizeof(float2)),
+              "Failed to allocate device_final_landmarks_");
+    checkCuda(cudaMalloc(&device_final_num_detections_, static_cast<size_t>(batch_sizes_[2]) * sizeof(int32_t)),
+              "Failed to allocate device_final_num_detections_");
+    checkCuda(cudaMalloc(&device_similarity_transforms_, postprocess_capacity * 6 * sizeof(float)),
+              "Failed to allocate device_similarity_transforms_");
+    const size_t warped_face_bytes =
+        postprocess_capacity *
+        static_cast<size_t>(kWarpedFaceChannels) *
+        static_cast<size_t>(kWarpedFaceSize) *
+        static_cast<size_t>(kWarpedFaceSize) *
+        sizeof(float);
+    checkCuda(cudaMalloc(&device_warped_faces_, warped_face_bytes),
+              "Failed to allocate device_warped_faces_");
+    checkCuda(cudaMalloc(&device_warped_faces_identification_, warped_face_bytes),
+              "Failed to allocate device_warped_faces_identification_");
     memory_usage += (postprocess_capacity * sizeof(float) +
                      postprocess_capacity * sizeof(int32_t) +
                      postprocess_capacity * sizeof(float) +
