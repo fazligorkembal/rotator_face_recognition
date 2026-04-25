@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Tactical Surveillance OS</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&amp;family=Inter:wght@400;500;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    "colors": {
+                        "surface-container-high": "#2a2a2b",
+                        "secondary-fixed-dim": "#ffb3b1",
+                        "on-surface": "#e5e2e3",
+                        "on-primary": "#003907",
+                        "surface-tint": "#00e639",
+                        "primary": "#ebffe2",
+                        "error": "#ffb4ab",
+                        "primary-fixed": "#72ff70",
+                        "tertiary-container": "#8ceaff",
+                        "inverse-on-surface": "#313031",
+                        "on-tertiary-container": "#006a7a",
+                        "primary-fixed-dim": "#00e639",
+                        "tertiary-fixed": "#a5eeff",
+                        "on-error": "#690005",
+                        "on-tertiary-fixed-variant": "#004e5a",
+                        "outline": "#84967e",
+                        "inverse-primary": "#006e16",
+                        "surface-container-highest": "#353436",
+                        "on-surface-variant": "#b9ccb2",
+                        "background": "#131314",
+                        "secondary-fixed": "#ffdad8",
+                        "surface-bright": "#3a393a",
+                        "on-primary-fixed": "#002203",
+                        "secondary": "#ffb3b1",
+                        "on-secondary-fixed": "#410007",
+                        "surface-dim": "#131314",
+                        "error-container": "#93000a",
+                        "tertiary-fixed-dim": "#00daf8",
+                        "outline-variant": "#3b4b37",
+                        "surface-variant": "#353436",
+                        "on-secondary-fixed-variant": "#92001c",
+                        "on-background": "#e5e2e3",
+                        "secondary-container": "#ff535a",
+                        "tertiary": "#eefbff",
+                        "surface-container": "#201f20",
+                        "on-error-container": "#ffdad6",
+                        "on-secondary": "#680011",
+                        "on-primary-container": "#007117",
+                        "on-secondary-container": "#5b000e",
+                        "inverse-surface": "#e5e2e3",
+                        "on-tertiary-fixed": "#001f25",
+                        "surface-container-low": "#1c1b1c",
+                        "surface-container-lowest": "#0e0e0f",
+                        "on-tertiary": "#00363f",
+                        "primary-container": "#00ff41",
+                        "surface": "#131314",
+                        "on-primary-fixed-variant": "#00530e"
+                    },
+                    "borderRadius": {
+                        "DEFAULT": "0.25rem",
+                        "lg": "0.5rem",
+                        "xl": "0.75rem",
+                        "full": "9999px"
+                    },
+                    "spacing": {
+                        "container-max": "1440px",
+                        "unit": "4px",
+                        "margin": "24px",
+                        "gutter": "16px"
+                    },
+                    "fontFamily": {
+                        "telemetry": ["Inter"],
+                        "headline-sm": ["Space Grotesk"],
+                        "body-fixed": ["Inter"],
+                        "display-tech": ["Space Grotesk"],
+                        "label-mono": ["Inter"]
+                    },
+                    "fontSize": {
+                        "telemetry": ["12px", { "lineHeight": "1.2", "letterSpacing": "0px", "fontWeight": "500" }],
+                        "headline-sm": ["18px", { "lineHeight": "1.2", "letterSpacing": "0.05em", "fontWeight": "600" }],
+                        "body-fixed": ["14px", { "lineHeight": "1.5", "letterSpacing": "0.01em", "fontWeight": "400" }],
+                        "display-tech": ["48px", { "lineHeight": "1.1", "letterSpacing": "-0.02em", "fontWeight": "700" }],
+                        "label-mono": ["11px", { "lineHeight": "1.0", "letterSpacing": "0.1em", "fontWeight": "700" }]
+                    }
+                }
+            }
+        }
+    </script>
+<style>
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+        .material-symbols-outlined[data-weight="fill"] {
+            font-variation-settings: 'FILL' 1;
+        }
+    </style>
+</head>
+<body class="bg-[#050505] text-on-background min-h-screen flex flex-col font-body-fixed text-body-fixed antialiased selection:bg-primary-container selection:text-on-primary-container">
+<!-- TopAppBar -->
+<header class="flex justify-between items-center w-full px-6 h-12 z-50 bg-[#050505]/80 backdrop-blur-md border-b-px border-[#2D2D30] docked full-width top-0 border-b border-[#2D2D30] flat no shadows">
+<div class="text-xl font-black text-[#00FF41] tracking-widest font-['Space_Grotesk'] tracking-tighter uppercase text-xs">
+            AEGIS_OS_v4.2
+        </div>
+<div class="flex items-center gap-4">
+<span class="material-symbols-outlined text-[#00FF41] hover:bg-[#00FF41]/10 hover:text-[#00FF41] transition-colors cursor-pointer p-1 rounded">settings_remote</span>
+<span class="material-symbols-outlined text-[#00FF41] hover:bg-[#00FF41]/10 hover:text-[#00FF41] transition-colors cursor-pointer p-1 rounded">sensors</span>
+<span class="material-symbols-outlined text-[#00FF41] hover:bg-[#00FF41]/10 hover:text-[#00FF41] transition-colors cursor-pointer p-1 rounded">security</span>
+</div>
+</header>
+<!-- Main Content -->
+<main class="flex-grow flex flex-col p-margin gap-margin">
+<!-- Video Feed Section -->
+<div class="relative w-full aspect-video border border-[#2D2D30] bg-[#141416] overflow-hidden flex-shrink-0 rounded">
+<div class="absolute inset-0 bg-cover bg-center opacity-50" data-alt="crowded airport terminal with people walking with luggage, high contrast, security camera style angle, wide shot" style="background-image: url('https://lh3.googleusercontent.com/aida-public/AB6AXuCBfvLUjT8mMN2SNhRLIO8Xv1150nZS4RrmkG5trVYfbRUWaMDN5MwQ8FJxsTYHNnpHfTRFGOsiVDlVA0sXdYb-Kx1b9gGV4NoKFe3oVh4qmlkJmJcdvMXhBArTK6IF2VyXFlbD93IZqz27nyiozIBuWVNi-3xHUHMqsn_DhMMO7DIYmYgQwLIe9hyZF2bwyTV0hoHglfRRq21wG5KhlSQYaEyY_nk1GlusCQDvhLG30KQAXK4Pxns-cTil2kVvogyKtyD2sLdeTEQ');"></div>
+<!-- Overlay Grids & HUD -->
+<div class="absolute inset-0 border border-primary-container/20 m-4 rounded pointer-events-none"></div>
+<!-- Simulated Bounding Boxes -->
+<!-- Detected 1 -->
+<div class="absolute top-[30%] left-[20%] w-[120px] h-[180px] border border-primary-container flex flex-col">
+<div class="bg-primary-container/20 text-primary-container font-label-mono text-label-mono px-1 py-0.5 whitespace-nowrap self-start border-b border-r border-primary-container">
+                    DETECTED
+                </div>
+<div class="relative flex-grow">
+<div class="absolute top-4 left-6 w-1 h-1 bg-primary-container rounded-full"></div>
+<div class="absolute top-4 right-6 w-1 h-1 bg-primary-container rounded-full"></div>
+<div class="absolute top-8 left-1/2 -translate-x-1/2 w-1 h-1 bg-primary-container rounded-full"></div>
+<div class="absolute bottom-6 left-1/4 w-1 h-1 bg-primary-container rounded-full"></div>
+<div class="absolute bottom-6 right-1/4 w-1 h-1 bg-primary-container rounded-full"></div>
+</div>
+<!-- Corner Brackets -->
+<div class="absolute -top-1 -left-1 w-2 h-2 border-t border-l border-primary-container"></div>
+<div class="absolute -top-1 -right-1 w-2 h-2 border-t border-r border-primary-container"></div>
+<div class="absolute -bottom-1 -left-1 w-2 h-2 border-b border-l border-primary-container"></div>
+<div class="absolute -bottom-1 -right-1 w-2 h-2 border-b border-r border-primary-container"></div>
+</div>
+<!-- Known Employee -->
+<div class="absolute top-[40%] right-[35%] w-[100px] h-[160px] border border-error flex flex-col">
+<div class="bg-error/20 text-error font-label-mono text-label-mono px-1 py-0.5 whitespace-nowrap self-start border-b border-r border-error">
+                    KNOWN_EMPLOYEE
+                </div>
+<div class="relative flex-grow">
+<div class="absolute top-3 left-4 w-1 h-1 bg-error rounded-full"></div>
+<div class="absolute top-3 right-4 w-1 h-1 bg-error rounded-full"></div>
+<div class="absolute top-6 left-1/2 -translate-x-1/2 w-1 h-1 bg-error rounded-full"></div>
+<div class="absolute bottom-4 left-1/4 w-1 h-1 bg-error rounded-full"></div>
+<div class="absolute bottom-4 right-1/4 w-1 h-1 bg-error rounded-full"></div>
+</div>
+<!-- Corner Brackets -->
+<div class="absolute -top-1 -left-1 w-2 h-2 border-t border-l border-error"></div>
+<div class="absolute -top-1 -right-1 w-2 h-2 border-t border-r border-error"></div>
+<div class="absolute -bottom-1 -left-1 w-2 h-2 border-b border-l border-error"></div>
+<div class="absolute -bottom-1 -right-1 w-2 h-2 border-b border-r border-error"></div>
+</div>
+<div class="absolute bottom-4 left-4 font-label-mono text-label-mono text-primary-container bg-surface-container-lowest/80 px-2 py-1 border border-[#2D2D30]">
+                CAM_01 // SEC_TERM_A // LIVE
+            </div>
+</div>
+<!-- Horizontal Dashboard -->
+<div class="flex flex-col md:flex-row gap-gutter">
+<!-- Operational Mode -->
+<div class="flex-1 border border-[#2D2D30] bg-[#141416] p-4 relative flex flex-col rounded">
+<span class="absolute top-0 left-0 bg-[#2D2D30] text-on-surface font-label-mono text-label-mono px-2 py-0.5 transform -translate-y-1/2 translate-x-2">OPERATIONAL_MODE</span>
+<div class="flex gap-4 mt-2 h-full">
+<button class="flex-1 border border-primary-container bg-primary-container/20 text-primary-container font-headline-sm text-headline-sm flex items-center justify-center gap-2 hover:bg-primary-container/30 transition-colors shadow-[0_0_10px_rgba(0,255,65,0.2)]">
+<span class="material-symbols-outlined" data-icon="search">search</span>
+                        SEARCH
+                    </button>
+<button class="flex-1 border border-[#2D2D30] bg-transparent text-on-surface-variant font-headline-sm text-headline-sm flex items-center justify-center gap-2 hover:bg-[#1F1F22] hover:text-on-surface transition-colors">
+<span class="material-symbols-outlined" data-icon="target">target</span>
+                        TRACK
+                    </button>
+</div>
+</div>
+<!-- System Metrics -->
+<div class="flex-1 border border-[#2D2D30] bg-[#141416] p-4 relative flex flex-col gap-2 rounded">
+<span class="absolute top-0 left-0 bg-[#2D2D30] text-on-surface font-label-mono text-label-mono px-2 py-0.5 transform -translate-y-1/2 translate-x-2">SYSTEM_METRICS</span>
+<div class="flex flex-col gap-2 mt-2">
+<div class="flex justify-between items-center border-b border-[#2D2D30] pb-1">
+<span class="font-label-mono text-label-mono text-on-surface-variant">CONFIDENCE</span>
+<span class="font-telemetry text-telemetry text-primary-container">98.4%</span>
+</div>
+<div class="flex justify-between items-center border-b border-[#2D2D30] pb-1">
+<span class="font-label-mono text-label-mono text-on-surface-variant">PROCESS_LATENCY</span>
+<span class="font-telemetry text-telemetry text-primary-container">142ms</span>
+</div>
+<div class="flex justify-between items-center">
+<span class="font-label-mono text-label-mono text-on-surface-variant">INPUT_SIZE</span>
+<span class="font-telemetry text-telemetry text-on-surface">1920x1080 / 640x640</span>
+</div>
+</div>
+</div>
+<!-- Resource Utilization -->
+<div class="flex-[2] border border-[#2D2D30] bg-[#141416] p-4 relative flex flex-col gap-4 rounded">
+<span class="absolute top-0 left-0 bg-[#2D2D30] text-on-surface font-label-mono text-label-mono px-2 py-0.5 transform -translate-y-1/2 translate-x-2">RESOURCE_UTILIZATION</span>
+<div class="mt-2 flex flex-col gap-3">
+<!-- CPU -->
+<div>
+<div class="flex justify-between mb-1">
+<span class="font-label-mono text-label-mono text-on-surface-variant">CPU_UTILIZATION</span>
+<span class="font-telemetry text-telemetry text-primary-container">64%</span>
+</div>
+<div class="flex gap-1 h-2">
+<div class="flex-1 bg-[#2D2D30] relative overflow-hidden"><div class="absolute inset-y-0 left-0 bg-primary-container w-[80%]"></div></div>
+<div class="flex-1 bg-[#2D2D30] relative overflow-hidden"><div class="absolute inset-y-0 left-0 bg-primary-container w-[60%]"></div></div>
+<div class="flex-1 bg-[#2D2D30] relative overflow-hidden"><div class="absolute inset-y-0 left-0 bg-primary-container w-[90%]"></div></div>
+<div class="flex-1 bg-[#2D2D30] relative overflow-hidden"><div class="absolute inset-y-0 left-0 bg-primary-container w-[40%]"></div></div>
+<div class="flex-1 bg-[#2D2D30] relative overflow-hidden"><div class="absolute inset-y-0 left-0 bg-primary-container w-[70%]"></div></div>
+<div class="flex-1 bg-[#2D2D30] relative overflow-hidden"><div class="absolute inset-y-0 left-0 bg-primary-container w-[50%]"></div></div>
+</div>
+</div>
+<!-- GPU -->
+<div>
+<div class="flex justify-between mb-1">
+<span class="font-label-mono text-label-mono text-on-surface-variant">GPU_UTILIZATION</span>
+<span class="font-telemetry text-telemetry text-error">92%</span>
+</div>
+<div class="w-full h-2 bg-[#2D2D30] relative overflow-hidden">
+<div class="absolute inset-y-0 left-0 bg-error w-[92%] shadow-[0_0_8px_rgba(255,180,171,0.5)]"></div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</main>
+</body></html>
