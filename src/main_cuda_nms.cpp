@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <filesystem>
+#include <limits>
 
 #include <opencv2/opencv.hpp>
 #include "tensorrt/logging.h"
@@ -261,6 +262,23 @@ int main(int argc, char **argv)
         camera_width,
         CV_8UC3,
         inferenceHelper.hostInputBuffer(DetectionType::SEARCH));
+    cv::Mat zero_copy_track_crop(
+        height,
+        width,
+        CV_8UC3,
+        inferenceHelper.hostInputBuffer(DetectionType::TRACK));
+    const cv::Rect tracking_crop_rect(
+        (camera_width - width) / 2,
+        (camera_height - height) / 2,
+        width,
+        height);
+    const int lock_min_x = camera_width / 2 - width / 2;
+    const int lock_max_x = camera_width / 2 + width / 2;
+    const int lock_min_y = camera_height / 2 - height / 2;
+    const int lock_max_y = camera_height / 2 + height / 2;
+    bool tracking_active = false;
+    std::string tracked_label;
+
     const double video_fps = cap.get(cv::CAP_PROP_FPS);
     int frame_index = 0;
     double elapsed_sum_ms = 0.0;
@@ -317,27 +335,70 @@ int main(int argc, char **argv)
         }
         else
         {
-            inferenceHelper.infer(zero_copy_frame.data, DetectionType::SEARCH);
-            const auto warped_faces = inferenceHelper.getDeviceWarpedFacesForIdentification(DetectionType::SEARCH);
-            const auto matches = identificationHelper.matchWarpedFaces(
-                warped_faces.device_faces,
-                warped_faces.batch_counts,
-                warped_faces.batch_count,
-                top_k,
-                face_threshold);
-
-            for (const auto &match : matches)
+            if (tracking_active)
             {
-                LOG_INFO("Detection match: face_index={}, label={}, average_similarity={:.4f}",
-                         match.face_index,
-                         match.label,
-                         match.average_similarity);
+                zero_copy_frame(tracking_crop_rect).copyTo(zero_copy_track_crop);
+                inferenceHelper.infer(zero_copy_track_crop.data, DetectionType::TRACK);
+                const auto warped_faces = inferenceHelper.getDeviceWarpedFacesForIdentification(DetectionType::TRACK);
+                const auto matches = identificationHelper.matchWarpedFaces(
+                    warped_faces.device_faces,
+                    warped_faces.batch_counts,
+                    warped_faces.batch_count,
+                    top_k,
+                    face_threshold);
+
+                bool target_found = false;
+                for (const auto &match : matches)
+                {
+                    if (match.label == tracked_label)
+                    {
+                        target_found = true;
+                        break;
+                    }
+                }
+
+                if (!target_found)
+                {
+                    tracking_active = false;
+                    is_tracking.store(false);
+                    tracked_label.clear();
+                }
             }
-
-            if (!matches.empty())
+            else
             {
-                cv::imshow("Detection", zero_copy_frame);
-                cv::waitKey(0);
+                inferenceHelper.infer(zero_copy_frame.data, DetectionType::SEARCH);
+                const auto warped_faces = inferenceHelper.getDeviceWarpedFacesForIdentification(DetectionType::SEARCH);
+                const auto matches = identificationHelper.matchWarpedFaces(
+                    warped_faces.device_faces,
+                    warped_faces.batch_counts,
+                    warped_faces.batch_count,
+                    top_k,
+                    face_threshold);
+
+                if (!matches.empty())
+                {
+                    const auto detections = inferenceHelper.getLastDetections(DetectionType::SEARCH);
+                    for (const auto &match : matches)
+                    {
+                        if (match.face_index < 0 ||
+                            match.face_index >= static_cast<int>(detections.size()))
+                        {
+                            continue;
+                        }
+
+                        const auto &box = detections[static_cast<size_t>(match.face_index)];
+                        const int center_x = (box.x1 + box.x2) / 2;
+                        const int center_y = (box.y1 + box.y2) / 2;
+                        if (center_x >= lock_min_x && center_x <= lock_max_x &&
+                            center_y >= lock_min_y && center_y <= lock_max_y)
+                        {
+                            tracking_active = true;
+                            is_tracking.store(true);
+                            tracked_label = match.label;
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -350,8 +411,11 @@ int main(int argc, char **argv)
         ++frame_index;
         if (frame_index % 50 == 0)
         {
-            LOG_INFO("Inference time (last 50): min={:.2f} mean={:.2f} max={:.2f} ms",
-                     elapsed_min_ms, elapsed_sum_ms / 50.0, elapsed_max_ms);
+            LOG_INFO("Inference time (last 50): mode={} min={:.2f} mean={:.2f} max={:.2f} ms",
+                     tracking_active ? "TRACK" : "SEARCH",
+                     elapsed_min_ms,
+                     elapsed_sum_ms / 50.0,
+                     elapsed_max_ms);
             elapsed_sum_ms = 0.0;
             elapsed_min_ms = std::numeric_limits<double>::max();
             elapsed_max_ms = 0.0;
