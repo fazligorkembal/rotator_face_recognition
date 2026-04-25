@@ -496,7 +496,10 @@ std::vector<IdentificationMatch> IdentificationModelInferenceHelper::matchWarped
     for (int start = 0; start < face_count;)
     {
         const int remaining = face_count - start;
-        const int r50_batch_count = remaining < max_batch_size_ ? 1 : max_batch_size_;
+        // Run the remaining faces in a single TRT batch whenever they fit.
+        // The previous logic collapsed every tail batch smaller than max_batch_size_
+        // to size 1, which turned multi-face frames into several serial R50 launches.
+        const int r50_batch_count = std::min(remaining, max_batch_size_);
 
         for (int batch_index = 0; batch_index < r50_batch_count; ++batch_index)
         {
@@ -583,6 +586,9 @@ std::vector<IdentificationMatch> IdentificationModelInferenceHelper::matchWarped
             }
 
             IdentificationMatch match;
+            // buildFaceOverlays() consumes detections in a compact, push_back order.
+            // Using the original flat `batch * top_k + rank` index breaks that mapping
+            // whenever an earlier slice has fewer than `top_k` detections.
             match.face_index = start + batch_index;
             match.label = unique_labels_[static_cast<size_t>(label_index)];
             match.average_similarity = host_best_label_scores_[static_cast<size_t>(batch_index)];

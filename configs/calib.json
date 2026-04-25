@@ -4,7 +4,7 @@
         "log_level": "debug"
     },
     "camera": {
-        "test_video_path": "/home/user/Documents/rfr/datasets/rfr/videos/video1.webm",
+        "test_video_path": "/home/user/Documents/rfr/datasets/rfr/videos/video2.webm",
         "width": 1920,
         "height": 1080, 
         "fps": 30,
