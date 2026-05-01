@@ -99,6 +99,9 @@
         .material-symbols-outlined[data-weight="fill"] {
             font-variation-settings: 'FILL' 1;
         }
+        #video-stage {
+            width: min(100%, 1280px, calc((100vh - 260px) * 16 / 9));
+        }
     </style>
 </head>
 <body class="bg-[#050505] text-on-background min-h-screen flex flex-col font-body-fixed text-body-fixed antialiased selection:bg-primary-container selection:text-on-primary-container">
@@ -116,17 +119,19 @@
 <!-- Main Content -->
 <main class="flex-grow flex flex-col p-margin gap-margin">
 <!-- Video Feed Section -->
-<div class="relative w-full aspect-video border border-[#2D2D30] bg-[#141416] overflow-hidden flex-shrink-0 rounded">
-<img alt="live browser stream" class="absolute inset-0 h-full w-full object-cover opacity-90" src="{{STREAM_URL}}"/>
+<div class="w-full border border-[#2D2D30] bg-[#141416] overflow-hidden flex-shrink-0 rounded p-3">
+<div id="video-stage" class="relative mx-auto aspect-video max-w-full overflow-hidden rounded">
+<img alt="live browser stream" class="absolute inset-0 h-full w-full object-fill opacity-90" src="{{STREAM_URL}}"/>
 <!-- Overlay Grids & HUD -->
 <div class="absolute inset-0 border border-primary-container/20 m-4 rounded pointer-events-none"></div>
 <div id="detection-overlay" class="absolute inset-0 pointer-events-none"></div>
 <div class="absolute bottom-4 left-4 font-label-mono text-label-mono text-primary-container bg-surface-container-lowest/80 px-2 py-1 border border-[#2D2D30]">
-                {{SOURCE_MODE}} // {{STATUS_TEXT}}
+                {{SOURCE_MODE}} // <span id="ai-mode">SEARCH</span>
             </div>
 <div class="absolute bottom-4 right-4 font-label-mono text-label-mono text-on-surface bg-surface-container-lowest/80 px-2 py-1 border border-[#2D2D30]">
                 AI <span id="ai-face-count">0</span> // <span id="ai-latency">0.0</span> MS
             </div>
+</div>
 </div>
 <!-- Horizontal Dashboard -->
 <div class="flex flex-col md:flex-row gap-gutter">
@@ -134,11 +139,11 @@
 <div class="flex-1 border border-[#2D2D30] bg-[#141416] p-4 relative flex flex-col rounded">
 <span class="absolute top-0 left-0 bg-[#2D2D30] text-on-surface font-label-mono text-label-mono px-2 py-0.5 transform -translate-y-1/2 translate-x-2">OPERATIONAL_MODE</span>
 <div class="flex gap-4 mt-2 h-full">
-<button class="flex-1 border border-primary-container bg-primary-container/20 text-primary-container font-headline-sm text-headline-sm flex items-center justify-center gap-2 hover:bg-primary-container/30 transition-colors shadow-[0_0_10px_rgba(0,255,65,0.2)]">
+<button id="mode-search" class="flex-1 border font-headline-sm text-headline-sm flex items-center justify-center gap-2 transition-colors">
 <span class="material-symbols-outlined" data-icon="search">search</span>
-                        {{SOURCE_MODE}}
+                        SEARCH
                     </button>
-<button class="flex-1 border border-[#2D2D30] bg-transparent text-on-surface-variant font-headline-sm text-headline-sm flex items-center justify-center gap-2 hover:bg-[#1F1F22] hover:text-on-surface transition-colors">
+<button id="mode-track" class="flex-1 border font-headline-sm text-headline-sm flex items-center justify-center gap-2 transition-colors">
 <span class="material-symbols-outlined" data-icon="target">target</span>
                         TRACK
                     </button>
@@ -199,10 +204,27 @@
 const overlay = document.getElementById('detection-overlay');
 const faceCount = document.getElementById('ai-face-count');
 const latency = document.getElementById('ai-latency');
+const aiMode = document.getElementById('ai-mode');
+const searchModeButton = document.getElementById('mode-search');
+const trackModeButton = document.getElementById('mode-track');
 let detectionsRequestInFlight = false;
 
 function clampPercent(value) {
     return Math.max(0, Math.min(100, value));
+}
+
+function setModeButtonState(button, active) {
+    button.style.borderColor = active ? '#00FF41' : '#2D2D30';
+    button.style.background = active ? 'rgba(0, 255, 65, 0.20)' : 'transparent';
+    button.style.color = active ? '#00FF41' : '#b9ccb2';
+    button.style.boxShadow = active ? '0 0 10px rgba(0, 255, 65, 0.20)' : 'none';
+}
+
+function renderMode(mode) {
+    const normalizedMode = String(mode || 'search').toLowerCase();
+    aiMode.textContent = normalizedMode.toUpperCase();
+    setModeButtonState(searchModeButton, normalizedMode === 'search');
+    setModeButtonState(trackModeButton, normalizedMode === 'track');
 }
 
 function renderDetections(data) {
@@ -211,6 +233,7 @@ function renderDetections(data) {
     overlay.replaceChildren();
     faceCount.textContent = String((data.faces || []).length);
     latency.textContent = Number(data.latency_ms || 0).toFixed(1);
+    renderMode(data.ai_mode);
 
     for (const face of data.faces || []) {
         const known = Boolean(face.known);
@@ -231,8 +254,6 @@ function renderDetections(data) {
         box.style.top = `${top}%`;
         box.style.width = `${boxWidth}%`;
         box.style.height = `${boxHeight}%`;
-        box.style.minWidth = '48px';
-        box.style.minHeight = '48px';
         box.style.border = `1px solid ${color}`;
         box.style.background = fill;
         box.style.boxShadow = `0 0 12px ${fill}`;
@@ -269,6 +290,7 @@ async function pollDetections() {
     }
 }
 
+renderMode('search');
 pollDetections();
 setInterval(pollDetections, 66);
 </script>

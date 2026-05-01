@@ -12,6 +12,7 @@
 #include <chrono>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <condition_variable>
 #include <csignal>
 #include <cstring>
@@ -21,11 +22,13 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime_api.h>
@@ -52,6 +55,120 @@ Logger gLogger(Severity::kINFO);
 constexpr int kFixedCaptureWidth = 1920;
 constexpr int kFixedCaptureHeight = 1080;
 constexpr int kFixedCaptureFps = 30;
+constexpr int kCameraFlipMethod180 = 2;
+
+const char *detectionTypeName(DetectionType detection_type)
+{
+    return detection_type == DetectionType::SEARCH ? "search" : "track";
+}
+
+cv::Rect makeCenteredRoiFromHalfExtents(int frame_width,
+                                        int frame_height,
+                                        int half_width,
+                                        int half_height)
+{
+    const int roi_width = std::clamp(half_width * 2, 1, frame_width);
+    const int roi_height = std::clamp(half_height * 2, 1, frame_height);
+    const int x = std::max(0, (frame_width - roi_width) / 2);
+    const int y = std::max(0, (frame_height - roi_height) / 2);
+    return cv::Rect(x, y, roi_width, roi_height);
+}
+
+cv::Point detectionCenter(const DetectionBox &detection)
+{
+    return cv::Point((detection.x1 + detection.x2) / 2, (detection.y1 + detection.y2) / 2);
+}
+
+std::optional<DetectionBox> findBestDetectionInRoi(const std::vector<DetectionBox> &detections,
+                                                   const cv::Rect &roi,
+                                                   int frame_center_x,
+                                                   int frame_center_y)
+{
+    std::optional<DetectionBox> best_detection;
+    int64_t best_distance_sq = std::numeric_limits<int64_t>::max();
+
+    for (const auto &detection : detections)
+    {
+        const cv::Point center = detectionCenter(detection);
+        if (!roi.contains(center))
+        {
+            continue;
+        }
+
+        const int64_t dx = static_cast<int64_t>(center.x) - frame_center_x;
+        const int64_t dy = static_cast<int64_t>(center.y) - frame_center_y;
+        const int64_t distance_sq = dx * dx + dy * dy;
+        if (!best_detection.has_value() ||
+            distance_sq < best_distance_sq ||
+            (distance_sq == best_distance_sq && detection.score > best_detection->score))
+        {
+            best_detection = detection;
+            best_distance_sq = distance_sq;
+        }
+    }
+
+    return best_detection;
+}
+
+std::vector<DetectionBox> mapTrackDetectionsToFrame(const std::vector<DetectionBox> &detections,
+                                                    const cv::Rect &track_roi,
+                                                    int model_width,
+                                                    int model_height)
+{
+    std::vector<DetectionBox> adjusted;
+    adjusted.reserve(detections.size());
+
+    const double scale_x = static_cast<double>(track_roi.width) / std::max(1, model_width);
+    const double scale_y = static_cast<double>(track_roi.height) / std::max(1, model_height);
+
+    for (const auto &detection : detections)
+    {
+        DetectionBox mapped = detection;
+        mapped.x1 = track_roi.x + static_cast<int>(std::lround(static_cast<double>(detection.x1) * scale_x));
+        mapped.y1 = track_roi.y + static_cast<int>(std::lround(static_cast<double>(detection.y1) * scale_y));
+        mapped.x2 = track_roi.x + static_cast<int>(std::lround(static_cast<double>(detection.x2) * scale_x));
+        mapped.y2 = track_roi.y + static_cast<int>(std::lround(static_cast<double>(detection.y2) * scale_y));
+        adjusted.push_back(mapped);
+    }
+
+    return adjusted;
+}
+
+class DetectionModeController
+{
+public:
+    explicit DetectionModeController(cv::Rect track_roi)
+        : track_roi_(std::move(track_roi))
+    {
+    }
+
+    DetectionType requestedMode() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return requested_mode_;
+    }
+
+    void updateFromDetections(const std::vector<DetectionBox> &detections,
+                              int frame_center_x,
+                              int frame_center_y)
+    {
+        const auto best_target = findBestDetectionInRoi(detections, track_roi_, frame_center_x, frame_center_y);
+        const DetectionType next_mode = best_target.has_value() ? DetectionType::TRACK : DetectionType::SEARCH;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (next_mode != requested_mode_)
+        {
+            LOG_INFO("AI mode switched to {}",
+                     next_mode == DetectionType::SEARCH ? "SEARCH" : "TRACK");
+        }
+        requested_mode_ = next_mode;
+    }
+
+private:
+    cv::Rect track_roi_;
+    mutable std::mutex mutex_;
+    DetectionType requested_mode_ = DetectionType::SEARCH;
+};
 
 void handleSignal(int)
 {
@@ -453,6 +570,7 @@ public:
                  int frame_width,
                  int frame_height,
                  double latency_ms,
+                 std::string ai_mode,
                  uint64_t source_sequence)
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -460,6 +578,7 @@ public:
         frame_width_ = frame_width;
         frame_height_ = frame_height;
         latency_ms_ = latency_ms;
+        ai_mode_ = std::move(ai_mode);
         source_sequence_ = source_sequence;
         ++sequence_;
     }
@@ -475,6 +594,7 @@ public:
              << "\"frame_width\":" << frame_width_ << ","
              << "\"frame_height\":" << frame_height_ << ","
              << "\"latency_ms\":" << latency_ms_ << ","
+             << "\"ai_mode\":\"" << escapeJson(ai_mode_) << "\","
              << "\"faces\":[";
 
         for (size_t i = 0; i < faces_.size(); ++i)
@@ -506,6 +626,7 @@ private:
     int frame_width_ = 0;
     int frame_height_ = 0;
     double latency_ms_ = 0.0;
+    std::string ai_mode_ = "search";
     uint64_t source_sequence_ = 0;
     uint64_t sequence_ = 0;
 };
@@ -524,7 +645,7 @@ public:
         return true;
     }
 
-    void finishWrite(bool has_frame)
+    void finishWrite(bool has_frame, DetectionType detection_type)
     {
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -532,12 +653,13 @@ public:
             if (has_frame)
             {
                 ++sequence_;
+                detection_type_ = detection_type;
             }
         }
         condition_.notify_one();
     }
 
-    bool waitForPending(uint64_t &sequence)
+    bool waitForPending(uint64_t &sequence, DetectionType &detection_type)
     {
         std::unique_lock<std::mutex> lock(mutex_);
         condition_.wait(lock, [&]() {
@@ -551,6 +673,7 @@ public:
 
         state_ = State::Running;
         sequence = sequence_;
+        detection_type = detection_type_;
         return true;
     }
 
@@ -581,6 +704,7 @@ private:
     std::condition_variable condition_;
     State state_ = State::Idle;
     uint64_t sequence_ = 0;
+    DetectionType detection_type_ = DetectionType::SEARCH;
 };
 
 class HttpServer
@@ -1027,8 +1151,9 @@ std::string buildCameraPipeline(const json &config, int width, int height)
         << "nvarguscamerasrc sensor-id=" << sensor_id << " ! "
         << "video/x-raw(memory:NVMM), width=" << width
         << ", height=" << height
-        << ", framerate=" << fps << "/1, format=NV12 ! "
-        << "nvvidconv ! video/x-raw, format=BGRx ! "
+        << ", framerate=" << fps << "/1 ! "
+        << "nvvidconv flip-method=" << kCameraFlipMethod180 << " ! "
+        << "video/x-raw, format=BGRx ! "
         << "videoconvert ! video/x-raw, format=BGR ! "
         << "queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! "
         << "appsink name=sink drop=true max-buffers=1 sync=false";
@@ -1350,7 +1475,17 @@ int main(int argc, char **argv)
     const int32_t num_slices_y = data_config["detection"]["num_slices_y"];
     const int32_t gap_x = data_config["detection"]["gap_x"];
     const int32_t gap_y = data_config["detection"]["gap_y"];
+    int track_window_half_width = data_config["detection"].value("track_window_half_width", detection_input_size / 2);
+    int track_window_half_height = data_config["detection"].value("track_window_half_height", detection_input_size / 2);
     double time_interval_face_record = data_config["camera"].value("time_interval_face_record", 1.0);
+    if (track_window_half_width <= 0)
+    {
+        track_window_half_width = detection_input_size / 2;
+    }
+    if (track_window_half_height <= 0)
+    {
+        track_window_half_height = detection_input_size / 2;
+    }
     if (time_interval_face_record <= 0.0)
     {
         time_interval_face_record = 1.0;
@@ -1468,13 +1603,45 @@ int main(int argc, char **argv)
     }
     LOG_INFO("Opening GStreamer source: {}", pipeline);
 
+    if (detection_input_size > camera_width || detection_input_size > camera_height)
+    {
+        LOG_ERROR("Detection input size {} exceeds camera frame {}x{}",
+                  detection_input_size,
+                  camera_width,
+                  camera_height);
+        cleanup_tensorrt();
+        gst_deinit();
+        return -1;
+    }
+
     ZeroCopyFrameBuffer display_frame_buffer(camera_width, camera_height);
     cv::Mat display_frame = display_frame_buffer.asMat();
-    cv::Mat ai_input_frame(
+    cv::Mat ai_search_input_frame(
         camera_height,
         camera_width,
         CV_8UC3,
         detection_helper->hostInputBuffer(DetectionType::SEARCH));
+    cv::Mat ai_track_input_frame(
+        detection_input_size,
+        detection_input_size,
+        CV_8UC3,
+        detection_helper->hostInputBuffer(DetectionType::TRACK));
+
+    const cv::Rect track_roi = makeCenteredRoiFromHalfExtents(
+        camera_width,
+        camera_height,
+        track_window_half_width,
+        track_window_half_height);
+    const int frame_center_x = camera_width / 2;
+    const int frame_center_y = camera_height / 2;
+    DetectionModeController detection_mode_controller(track_roi);
+    LOG_INFO("Track ROI centered at frame with half-window {}x{}: x={}, y={}, w={}, h={}",
+             track_window_half_width,
+             track_window_half_height,
+             track_roi.x,
+             track_roi.y,
+             track_roi.width,
+             track_roi.height);
 
     LatestJpegFrame latest_jpeg_frame(jpeg_quality);
     LatestInferenceResult latest_inference_result;
@@ -1506,7 +1673,8 @@ int main(int argc, char **argv)
     LOG_INFO("MJPEG stream: http://{}:{}/stream.mjpg", ip_address, web_port);
     LOG_INFO("Display zero-copy host ptr: {}", static_cast<void *>(display_frame_buffer.hostData()));
     LOG_INFO("Display zero-copy device ptr: {}", display_frame_buffer.deviceData());
-    LOG_INFO("AI zero-copy host ptr: {}", static_cast<void *>(ai_input_frame.data));
+    LOG_INFO("AI search buffer host ptr: {}", static_cast<void *>(ai_search_input_frame.data));
+    LOG_INFO("AI track buffer host ptr: {}", static_cast<void *>(ai_track_input_frame.data));
 
     GStreamerAppSinkSource source;
     try
@@ -1539,7 +1707,8 @@ int main(int argc, char **argv)
         while (is_run.load())
         {
             uint64_t source_sequence = 0;
-            if (!ai_frame_slot.waitForPending(source_sequence))
+            DetectionType detection_type = DetectionType::SEARCH;
+            if (!ai_frame_slot.waitForPending(source_sequence, detection_type))
             {
                 break;
             }
@@ -1547,9 +1716,18 @@ int main(int argc, char **argv)
             try
             {
                 const auto start_time = std::chrono::high_resolution_clock::now();
-                detection_helper->infer(ai_input_frame.data, DetectionType::SEARCH);
-                const auto detections =
-                    detection_helper->getLastDetections(DetectionType::SEARCH);
+                detection_helper->infer(
+                    detection_type == DetectionType::SEARCH ? ai_search_input_frame.data : ai_track_input_frame.data,
+                    detection_type);
+                auto detections = detection_helper->getLastDetections(detection_type);
+                if (detection_type == DetectionType::TRACK)
+                {
+                    detections = mapTrackDetectionsToFrame(
+                        detections,
+                        track_roi,
+                        detection_input_size,
+                        detection_input_size);
+                }
                 std::vector<IdentificationMatch> matches;
                 if (face_record_mode)
                 {
@@ -1559,7 +1737,7 @@ int main(int argc, char **argv)
                             std::chrono::duration_cast<std::chrono::steady_clock::duration>(face_record_interval))
                     {
                         const int saved_count =
-                            saveDetectedFaceCrops(ai_input_frame,
+                            saveDetectedFaceCrops(ai_search_input_frame,
                                                   detections,
                                                   face_record_dir,
                                                   source_sequence,
@@ -1574,7 +1752,7 @@ int main(int argc, char **argv)
                 else if (!detections.empty())
                 {
                     const auto warped_faces =
-                        detection_helper->getDeviceWarpedFacesForIdentification(DetectionType::SEARCH);
+                        detection_helper->getDeviceWarpedFacesForIdentification(detection_type);
                     matches = identification_helper->matchWarpedFaces(
                         warped_faces.device_faces,
                         warped_faces.batch_counts,
@@ -1586,11 +1764,13 @@ int main(int argc, char **argv)
 
                 const double elapsed_ms =
                     std::chrono::duration<double, std::milli>(end_time - start_time).count();
+                detection_mode_controller.updateFromDetections(detections, frame_center_x, frame_center_y);
                 latest_inference_result.publish(
                     buildFaceOverlays(detections, matches, camera_width, camera_height),
                     camera_width,
                     camera_height,
                     elapsed_ms,
+                    detectionTypeName(detection_type),
                     source_sequence);
 
                 elapsed_sum_ms += elapsed_ms;
@@ -1630,7 +1810,8 @@ int main(int argc, char **argv)
             continue;
         }
 
-        cv::Mat &target_frame = write_ai_frame ? ai_input_frame : display_frame;
+        const DetectionType requested_detection_type = detection_mode_controller.requestedMode();
+        cv::Mat &target_frame = write_ai_frame ? ai_search_input_frame : display_frame;
         const bool keep_running = source.copyFrameTo(
             target_frame,
             camera_width,
@@ -1638,7 +1819,25 @@ int main(int argc, char **argv)
             frame_updated);
         if (write_ai_frame)
         {
-            ai_frame_slot.finishWrite(frame_updated);
+            if (frame_updated && requested_detection_type == DetectionType::TRACK)
+            {
+                const cv::Mat track_source = ai_search_input_frame(track_roi);
+                if (track_source.cols == ai_track_input_frame.cols &&
+                    track_source.rows == ai_track_input_frame.rows)
+                {
+                    track_source.copyTo(ai_track_input_frame);
+                }
+                else
+                {
+                    cv::resize(track_source,
+                               ai_track_input_frame,
+                               ai_track_input_frame.size(),
+                               0.0,
+                               0.0,
+                               cv::INTER_LINEAR);
+                }
+            }
+            ai_frame_slot.finishWrite(frame_updated, requested_detection_type);
         }
 
         if (!keep_running)

@@ -24,13 +24,15 @@
         "num_slices_x": 3,
         "num_slices_y": 2,
         "gap_x": 128,
-        "gap_y": 200
+        "gap_y": 200,
+        "track_window_half_width": 320,
+        "track_window_half_height": 320
     },
     "identification": {
         "model_path": "/home/user/Documents/rfr/models/r50.engine",
         "input_size": 112,
         "identifier_threshold_min_box_length": 20,
         "batch_sizes": [1, 1, 8],
-        "face_threshold": 0.6
+        "face_threshold": 0.4
     }
 }
